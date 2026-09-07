@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""ag-policy — ag v2.4 项目信任与档位策略。
+
+用法：
+  ag-policy show | list
+  ag-policy trust | untrust | protect        # 作用于 cwd 的 git root
+  ag-policy set-mode safe|auto|yolo [--provider codex|claude]
+  ag-policy --root /path/to/project trust
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.expanduser("~/.local/share/ag"))
+
+from runtime import policy_cli  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(policy_cli.main(sys.argv[1:]))

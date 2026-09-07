@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+if ! tmux list-sessions >/dev/null 2>&1; then
+    echo "当前没有运行中的 tmux Session。"
+    exit 0
+fi
+
+printf "%-26s %-10s %-9s %-16s %-12s %s\n" \
+    "SESSION" "STATUS" "WINDOWS" "WINDOW" "COMMAND" "PATH"
+
+printf "%-26s %-10s %-9s %-16s %-12s %s\n" \
+    "-------" "------" "-------" "------" "-------" "----"
+
+while IFS= read -r session; do
+
+    windows=$(tmux display-message -p -t "=$session:" '#{session_windows}')
+    attached=$(tmux display-message -p -t "=$session:" '#{session_attached}')
+    window=$(tmux display-message -p -t "=$session:" '#{window_name}')
+    command=$(tmux display-message -p -t "=$session:" '#{pane_current_command}')
+    path=$(tmux display-message -p -t "=$session:" '#{pane_current_path}')
+
+    if [[ "$attached" == "1" ]]; then
+        status="ATTACHED"
+    else
+        status="DETACHED"
+    fi
+
+    printf "%-26s %-10s %-9s %-16s %-12s %s\n" \
+        "$session" "$status" "$windows" "$window" "$command" "$path"
+
+done < <(tmux list-sessions -F '#{session_name}')

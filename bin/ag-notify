@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""ag-notify EVENT RUNTIME_ID — ag v2.4 统一通知命令。
+
+内部桥接现有 agent-notify（ntfy.sh → Windows PWA），映射见
+runtime/notification.py。同一 runtime 同一事件 24h 内只发一次。
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.expanduser("~/.local/share/ag"))
+
+from runtime import cli  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(cli.main(["notify"] + sys.argv[1:]))

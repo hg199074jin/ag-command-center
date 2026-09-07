@@ -1,0 +1,68 @@
+#!/bin/bash
+# ag-v2.4-rollback — 回滚 ag v2.4 sidecar，还原 ag v2.3.2
+# 能力：1) 还原 ag 主脚本  2) 还原 ~/.claude/settings.json（可选）
+#      3) sidecar 改名 .disabled 保留  4) 不删除任何 tmux session / 历史 session
+set -u
+
+BACKUP="${1:-}"
+if [ -z "$BACKUP" ]; then
+  if [ -r /tmp/ag-v24-backup-path.txt ]; then
+    BACKUP="$(cat /tmp/ag-v24-backup-path.txt)"
+  else
+    BACKUP="$(ls -d "$HOME"/config-backup/ag-v2.4-* 2>/dev/null | sort | tail -1)"
+  fi
+fi
+if [ -z "$BACKUP" ] || [ ! -d "$BACKUP" ]; then
+  echo "❌ 找不到备份目录。用法：ag-v2.4-rollback [备份目录路径]"
+  exit 1
+fi
+echo "备份目录：$BACKUP"
+echo
+echo "将执行："
+echo "  1. 还原 $HOME/.local/bin/ag ← $BACKUP/ag"
+echo "  2. v2.4 sidecar 改名 .disabled（保留数据）"
+echo "  3. 不动 tmux session、不动 registry、不动任何密钥"
+echo
+read -r -p "确认回滚？[y/N] " answer
+case "$answer" in
+  y|Y) ;;
+  *) echo "已取消。"; exit 0 ;;
+esac
+
+# 1) 还原 ag 主脚本
+if [ -f "$BACKUP/ag" ]; then
+  cp -a "$BACKUP/ag" "$HOME/.local/bin/ag" &&
+    echo "✅ ag 主脚本已还原"
+else
+  echo "❌ 备份中无 ag 主脚本，跳过"
+fi
+
+# 2) sidecar 改名保留
+for f in "$HOME/.config/ag/runtime-policy.json" \
+         "$HOME/.local/state/ag/runtime/runtime-state.json" \
+         "$HOME/.local/state/ag/runtime/provider-capabilities.json" \
+         "$HOME/.local/state/ag/runtime/notification.json" \
+         "$HOME/.local/state/ag/runtime/usage-history.jsonl"; do
+  if [ -f "$f" ]; then
+    mv -f "$f" "$f.disabled" && echo "🔒 $f → $(basename "$f").disabled"
+  fi
+done
+
+# 3) 可选：还原 claude settings.json（若批次 B 改过 hooks）
+if [ -f "$BACKUP/claude-settings.json" ]; then
+  read -r -p "是否同时还原 ~/.claude/settings.json（会撤销 v2.4 hooks 合并）？[y/N] " a2
+  case "$a2" in
+    y|Y)
+      if jq empty "$BACKUP/claude-settings.json" 2>/dev/null; then
+        cp -a "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.pre-rollback" 2>/dev/null || true
+        cp -a "$BACKUP/claude-settings.json" "$HOME/.claude/settings.json" &&
+          echo "✅ settings.json 已还原（旧文件存为 settings.json.pre-rollback）"
+      else
+        echo "❌ 备份 settings.json 校验失败，未还原"
+      fi
+      ;;
+  esac
+fi
+
+echo
+echo "回滚完成。v2.4 数据均已改名保留，可随时删除 .disabled 后缀恢复。"

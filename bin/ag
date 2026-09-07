@@ -1,0 +1,2670 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# ag v2.4.0 - AG Command Center
+# 基于 Gum 的分层菜单 + 项目 registry + 会话中心
+# 兼容 AG 2.1 的状态目录 / 最近项目 / tmux 会话命名
+# v2.4 增量：SAFE/AUTO/YOLO + YOLO gate + runtime sidecar（详见 ~/.local/share/ag/runtime）
+# Compatible with macOS Bash 3.2+
+# ============================================================
+
+set -u
+
+AG_VERSION="2.4.0"
+
+# 保证在非交互/launchd 环境下也能找到工具
+for _d in "$HOME/.local/bin" /opt/homebrew/bin; do
+  [ -d "$_d" ] && case ":$PATH:" in
+    *":$_d:"*) ;;
+    *) PATH="$_d:$PATH" ;;
+  esac
+done
+export PATH
+
+# AG 2.1 兼容：可选配置文件
+AG_CONFIG_FILE="$HOME/.config/ag/config"
+if [ -r "$AG_CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$AG_CONFIG_FILE"
+fi
+
+: "${AG_STATE_DIR:=$HOME/.local/state/ag}"
+: "${AG_LOG_FILE:=$AG_STATE_DIR/logs/ag.log}"
+: "${AG_RECENT_FILE:=$AG_STATE_DIR/recent-projects}"
+: "${AG_RECENT_LIMIT:=15}"
+: "${AG_ORICO_VOLUME:=/Volumes/ORICO}"
+: "${AG_PROJECT_ROOT:=$AG_ORICO_VOLUME/Projects}"
+: "${AG_FALLBACK_ROOTS:=$AG_ORICO_VOLUME/AI $HOME/Documents/Codex}"
+: "${AG_AGENTBOARD_PORT:=4040}"
+: "${AG_AGENTBOARD_LABEL:=com.sandro.agentboard}"
+AG_CURRENT_FILE="${AG_CURRENT_FILE:-$AG_STATE_DIR/current-project}"
+AG_LOG_MAX_BYTES="${AG_LOG_MAX_BYTES:-5242880}"
+# 项目 registry（v2.3.2）：两态运行/完成状态，归 state 目录（config/state 分离）
+AG_REGISTRY_DIR="${AG_REGISTRY_DIR:-$AG_STATE_DIR/projects}"
+
+# ------------------------------------------------------------
+# 基础工具（与 AG 2.1 保持一致）
+# ------------------------------------------------------------
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+pause() {
+  printf '\n按 Enter 继续...'
+  IFS= read -r _
+}
+
+sanitize_name() {
+  printf '%s' "$1" \
+    | sed -E 's/[^A-Za-z0-9_-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
+}
+
+pretty_path() {
+  # shellcheck disable=SC2088  # 这里的 ~ 是展示用的字面量，不参与展开
+  case "$1" in
+    "$HOME")
+      printf '~'
+      ;;
+    "$HOME"/*)
+      printf '~/%s' "${1#"$HOME"/}"
+      ;;
+    *)
+      printf '%s' "$1"
+      ;;
+  esac
+}
+
+# shellcheck disable=SC2088  # canonical_dir 中匹配的是字面量 ~ 与 ~/，属预期
+canonical_dir() {
+  local input="$1"
+
+  case "$input" in
+    '~')
+      input="$HOME"
+      ;;
+    '~/'*)
+      input="$HOME/${input#\~/}"
+      ;;
+  esac
+
+  if [ -d "$input" ]; then
+    (
+      cd "$input" 2>/dev/null &&
+      pwd -P
+    )
+  else
+    return 1
+  fi
+}
+
+list_sessions_raw() {
+  tmux list-sessions -F '#{session_name}' 2>/dev/null || true
+}
+
+session_exists() {
+  tmux has-session -t "=$1" 2>/dev/null
+}
+
+session_path() {
+  tmux display-message \
+    -p \
+    -t "=$1:" \
+    '#{pane_current_path}' \
+    2>/dev/null || true
+}
+
+session_command() {
+  tmux display-message \
+    -p \
+    -t "=$1:" \
+    '#{pane_current_command}' \
+    2>/dev/null || true
+}
+
+launcher_key() {
+  case "$1" in
+    Codex|codex) printf 'codex' ;;
+    Claude|claude) printf 'claude' ;;
+    Shell|shell) printf 'shell' ;;
+    *) return 1 ;;
+  esac
+}
+
+session_option_get() {
+  local session="$1"
+  local option="$2"
+  tmux show-options -qv -t "=$session:" "$option" 2>/dev/null || true
+}
+
+session_set_identity() {
+  local session="$1"
+  local project_id="$2"
+  local project_path="$3"
+  local agent="$4"
+  local launch_mode="${5:-standard}"
+  local agent_key
+
+  agent_key=$(launcher_key "$agent") || return 1
+
+  tmux set-option -q -t "=$session:" @ag_project_id "$project_id" &&
+    tmux set-option -q -t "=$session:" @ag_project_path "$project_path" &&
+    tmux set-option -q -t "=$session:" @ag_agent "$agent_key" &&
+    tmux set-option -q -t "=$session:" @ag_launch_mode "$launch_mode"
+}
+
+session_identity_matches() {
+  local session="$1"
+  local project_id="$2"
+  local project_path="$3"
+  local stored_id
+  local stored_path
+  local live_path
+
+  session_exists "$session" || return 1
+
+  stored_id=$(session_option_get "$session" @ag_project_id)
+  if [ -n "$stored_id" ]; then
+    [ "$stored_id" = "$project_id" ]
+    return
+  fi
+
+  stored_path=$(session_option_get "$session" @ag_project_path)
+  if [ -n "$stored_path" ]; then
+    [ "$stored_path" = "$project_path" ]
+    return
+  fi
+
+  # AG 2.1-2.3.0 legacy fallback: adopt only an exact current-pane path match.
+  live_path=$(session_path "$session")
+  [ -n "$live_path" ] && [ "$live_path" = "$project_path" ]
+}
+
+session_detect_agent() {
+  local session="$1"
+  local cmd
+
+  cmd=$(session_command "$session")
+  case "$cmd" in
+    codex) printf 'codex' ;;
+    claude) printf 'claude' ;;
+    bash|zsh|fish|sh) printf 'shell' ;;
+    node)
+      if tmux capture-pane -p -t "=$session:" 2>/dev/null | head -40 | grep -qi 'codex'; then
+        printf 'codex'
+      elif tmux capture-pane -p -t "=$session:" 2>/dev/null | head -40 | grep -qi 'claude'; then
+        printf 'claude'
+      else
+        return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+session_agent_matches() {
+  local session="$1"
+  local launcher="$2"
+  local wanted
+  local actual
+
+  wanted=$(launcher_key "$launcher") || return 1
+  actual=$(session_option_get "$session" @ag_agent)
+  [ -n "$actual" ] || actual=$(session_detect_agent "$session")
+  [ "$actual" = "$wanted" ]
+}
+
+session_launch_mode_matches() {
+  local session="$1"
+  local wanted="${2:-standard}"
+  local actual
+
+  actual=$(session_option_get "$session" @ag_launch_mode)
+  [ -n "$actual" ] || actual='standard'
+  [ "$actual" = "$wanted" ]
+}
+
+unique_session_name() {
+  local base="$1"
+  local dir="$2"
+  local launcher="${3:-Shell}"
+  local launch_mode="${4:-standard}"
+  local candidate="$base"
+  local stem="$base"
+  local project_id
+  local agent_key
+  local n=2
+
+  project_id=$(registry_id_for_path "$dir") || return 1
+  agent_key=$(launcher_key "$launcher") || return 1
+
+  if ! session_exists "$candidate"; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  if session_identity_matches "$candidate" "$project_id" "$dir" &&
+     session_agent_matches "$candidate" "$launcher" &&
+     session_launch_mode_matches "$candidate" "$launch_mode"; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  if session_identity_matches "$candidate" "$project_id" "$dir"; then
+    if session_agent_matches "$candidate" "$launcher"; then
+      stem="${base}-${agent_key}-${launch_mode}"
+    else
+      stem="${base}-${agent_key}"
+    fi
+    candidate="$stem"
+    if ! session_exists "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    if session_identity_matches "$candidate" "$project_id" "$dir" &&
+       session_agent_matches "$candidate" "$launcher" &&
+       session_launch_mode_matches "$candidate" "$launch_mode"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  fi
+
+  while session_exists "${stem}-${n}"; do
+    n=$((n + 1))
+  done
+
+  printf '%s-%s' "$stem" "$n"
+}
+
+enter_session() {
+  local name="$1"
+
+  if ! have tmux; then
+    echo "错误：没有找到 tmux。"
+    return 1
+  fi
+
+  if ! session_exists "$name"; then
+    echo "Session 不存在：$name"
+    return 1
+  fi
+
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "=$name"
+  else
+    tmux attach-session -t "=$name"
+  fi
+}
+
+ag_choose_default_root() {
+  local candidate
+
+  if [ -d "$AG_PROJECT_ROOT" ]; then
+    printf '%s' "$AG_PROJECT_ROOT"
+    return 0
+  fi
+
+  for candidate in $AG_FALLBACK_ROOTS; do
+    [ -d "$candidate" ] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+
+  printf '%s' "$HOME"
+}
+
+# ------------------------------------------------------------
+# 日志（带轮转）/ 当前项目 / 最近项目
+# ------------------------------------------------------------
+
+state_init() {
+  mkdir -p "$AG_STATE_DIR" "$AG_STATE_DIR/logs" 2>/dev/null || return 1
+  chmod 700 "$AG_STATE_DIR" "$AG_STATE_DIR/logs" 2>/dev/null || return 1
+}
+
+ag_log() {
+  # 支持可选级别参数：ag_log [INFO|WARN|ERROR] <message>
+  # 旧调用（首参直接是消息）保持兼容
+  local level="INFO"
+  case "${1:-}" in
+    INFO|WARN|ERROR)
+      level="$1"
+      shift
+      ;;
+  esac
+
+  local size
+
+  state_init || return 1
+
+  if [ -f "$AG_LOG_FILE" ]; then
+    size=$(wc -c < "$AG_LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$AG_LOG_MAX_BYTES" ] 2>/dev/null; then
+      mv -f "$AG_LOG_FILE" "$AG_LOG_FILE.1" 2>/dev/null || true
+    fi
+  fi
+
+  printf '%s [%s] %s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "$level" \
+    "$*" >> "$AG_LOG_FILE" 2>/dev/null || true
+}
+
+current_project() {
+  [ -r "$AG_CURRENT_FILE" ] || return 1
+  local p
+  p=$(head -n 1 "$AG_CURRENT_FILE" 2>/dev/null || true)
+  [ -n "$p" ] || return 1
+  printf '%s' "$p"
+}
+
+set_current_project() {
+  local dir="$1"
+  local tmp
+
+  state_init || return 1
+  tmp=$(mktemp "${AG_CURRENT_FILE}.tmp.XXXXXX") || return 1
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  if printf '%s\n' "$dir" > "$tmp"; then
+    if mv "$tmp" "$AG_CURRENT_FILE" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+ag_add_recent_project() {
+  local project="$1"
+  local tmp
+
+  state_init || return 1
+  [ -d "$project" ] || return 1
+  project=$(canonical_dir "$project") || return 1
+
+  tmp=$(mktemp "${AG_RECENT_FILE}.tmp.XXXXXX") || return 1
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+
+  {
+    printf '%s\n' "$project"
+    grep -Fxv -- "$project" "$AG_RECENT_FILE" 2>/dev/null || true
+  } | awk 'NF && !seen[$0]++' | head -n "$AG_RECENT_LIMIT" > "$tmp" 2>/dev/null
+
+  mv "$tmp" "$AG_RECENT_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# 从 recent-projects 中删除一条记录（原子写回）
+ag_remove_recent_project() {
+  local project="$1"
+  local tmp
+
+  state_init || return 1
+  tmp=$(mktemp "${AG_RECENT_FILE}.tmp.XXXXXX") || return 1
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  grep -Fxv -- "$project" "$AG_RECENT_FILE" 2>/dev/null > "$tmp" || true
+  mv "$tmp" "$AG_RECENT_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# ------------------------------------------------------------
+# 项目 registry（v2.3.2：lifecycle 落盘；runtime 实时计算不落盘）
+# ------------------------------------------------------------
+
+ag_now() {
+  date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+registry_init() {
+  state_init || return 1
+  [ -d "$AG_REGISTRY_DIR" ] || mkdir -p "$AG_REGISTRY_DIR" 2>/dev/null || return 1
+  chmod 700 "$AG_REGISTRY_DIR" 2>/dev/null || return 1
+  return 0
+}
+
+registry_id_for_path() {
+  local canon
+  canon=$(canonical_dir "$1") || return 1
+  printf '%s' "$canon" | shasum -a 256 | cut -c1-16
+}
+
+registry_write_atomic() {
+  local target="$1"
+  local content="$2"
+  local tmp
+
+  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  if ! printf '%s\n' "$content" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if ! jq empty "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    ag_log ERROR "registry json invalid: $target"
+    return 1
+  fi
+
+  mv "$tmp" "$target"
+}
+
+registry_create() {
+  local name="$1"
+  local path="$2"
+  local id
+  local now
+  local json
+
+  have jq || return 1
+  registry_init || return 1
+  path=$(canonical_dir "$path") || return 1
+  id=$(registry_id_for_path "$path") || return 1
+  [ -f "${AG_REGISTRY_DIR}/${id}.json" ] && return 0
+
+  now=$(ag_now)
+  json=$(jq -n \
+    --arg id "$id" \
+    --arg name "$name" \
+    --arg path "$path" \
+    --arg now "$now" \
+    '{id:$id, name:$name, path:$path, agent:"none", lifecycle:"done", tmux_session:null, created_at:$now, updated_at:$now, last_active_at:null}')
+
+  registry_write_atomic "${AG_REGISTRY_DIR}/${id}.json" "$json"
+}
+
+registry_get() {
+  # registry_get <id> <field>
+  local f="${AG_REGISTRY_DIR}/$1.json"
+  [ -r "$f" ] || return 1
+  jq -r --arg k "$2" '.[$k] // empty' "$f" 2>/dev/null
+}
+
+registry_set_field() {
+  local id="$1"
+  local field="$2"
+  local value="$3"
+  local f="${AG_REGISTRY_DIR}/${id}.json"
+  local out
+
+  [ -f "$f" ] || return 1
+
+  out=$(jq --arg k "$field" --arg v "$value" --arg now "$(ag_now)" \
+    '.[$k] = $v | .updated_at = $now' "$f" 2>/dev/null) || {
+    ag_log ERROR "registry read failed: $f"
+    return 1
+  }
+
+  registry_write_atomic "$f" "$out"
+}
+
+# 输出: id<TAB>name<TAB>lifecycle<TAB>agent<TAB>tmux_session<TAB>path
+registry_iter() {
+  local f
+  local output
+  local -a files=()
+
+  [ -d "$AG_REGISTRY_DIR" ] || return 0
+  for f in "$AG_REGISTRY_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    files+=("$f")
+  done
+
+  [ "${#files[@]}" -gt 0 ] || return 0
+
+  if output=$(jq -r \
+    '[(input_filename | split("/")[-1] | sub("\\.json$"; "")), .name, .lifecycle, (.agent // "none"), (.tmux_session // "-"), .path] | @tsv' \
+    "${files[@]}" 2>/dev/null); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+
+  # Corrupt-record fallback is deliberately slower so one bad file does not
+  # hide every valid project. Normal valid registries use the single jq above.
+  for f in "${files[@]}"; do
+    if ! output=$(jq -r \
+      '[(input_filename | split("/")[-1] | sub("\\.json$"; "")), .name, .lifecycle, (.agent // "none"), (.tmux_session // "-"), .path] | @tsv' \
+      "$f" 2>/dev/null); then
+      ag_log ERROR "registry corrupt, skipped: $f" || true
+      continue
+    fi
+    printf '%s\n' "$output"
+  done
+}
+
+# runtime 实时判定：tmux identity 必须与 registry 项目一致（v2.3.2 硬性规则）
+registry_project_running() {
+  local id="$1"
+  local ts="${2:-}"
+  local path="${3:-}"
+
+  [ -n "$ts" ] || ts=$(registry_get "$id" "tmux_session") || return 1
+  [ -n "$path" ] || path=$(registry_get "$id" "path") || return 1
+  [ -n "$ts" ] && [ "$ts" != "null" ] && [ "$ts" != "-" ] || return 1
+  session_identity_matches "$ts" "$id" "$path"
+}
+
+# 项目成功启动/复用会话后调用：更新（或补建）registry，lifecycle → active
+registry_record_start() {
+  local dir="$1"
+  local launcher="$2"
+  local session_name="$3"
+  local launch_mode="${4:-standard}"
+  local id
+  local agent_key
+  local f
+  local now
+  local out
+
+  have jq || return 1
+  id=$(registry_id_for_path "$dir") || return 1
+
+  if [ ! -f "${AG_REGISTRY_DIR}/${id}.json" ]; then
+    registry_create "$(basename "$dir")" "$dir" || return 1
+  fi
+
+  agent_key=$(launcher_key "$launcher") || return 1
+  [ "$agent_key" = 'shell' ] && agent_key='none'
+  f="${AG_REGISTRY_DIR}/${id}.json"
+  now=$(ag_now)
+  out=$(jq \
+    --arg agent "$agent_key" \
+    --arg lifecycle 'active' \
+    --arg session "$session_name" \
+    --arg mode "$launch_mode" \
+    --arg now "$now" \
+    '.agent = $agent | .lifecycle = $lifecycle | .tmux_session = $session | .launch_mode = $mode | .last_active_at = $now | .updated_at = $now' \
+    "$f" 2>/dev/null) || {
+      ag_log ERROR "registry read failed: $f" || true
+      return 1
+    }
+
+  registry_write_atomic "$f" "$out" || {
+    ag_log ERROR "registry write failed: $f" || true
+    return 1
+  }
+  ag_log "registry start id=$id session=$session_name launcher=$launcher mode=$launch_mode" || true
+}
+
+# ------------------------------------------------------------
+# Gum 菜单辅助
+# ------------------------------------------------------------
+
+require_gum() {
+  if ! have gum; then
+    echo "错误：没有找到 gum（AG 交互菜单依赖它）。"
+    return 1
+  fi
+  if [ ! -t 0 ]; then
+    echo "交互菜单需要在终端中运行。"
+    echo "非交互场景请使用：ag status / doctor / project current / project list / session list"
+    return 1
+  fi
+}
+
+banner() {
+  gum style \
+    --border double \
+    --border-foreground 212 \
+    --padding "0 2" \
+    --align center \
+    "AG · Agent Command Center" \
+    "v${AG_VERSION}" 2>/dev/null || true
+}
+
+# menu_pick <标题> <选项...>：输出所选选项
+# v2.3.2：safe-choose 语义的唯一正式入口
+#   - gum（bubbletea）只在 stderr 为真实 tty 时渲染交互界面，必须直连 /dev/tty，
+#     用 2>/dev/null 或管道都会导致菜单不可见（实测确认）
+#   - 取消时 gum 会清掉自己的界面帧、在原处留一行提示（nothing selected），
+#     这里上移一行清除，保证 TUI 不被污染
+#   - Esc/取消静默返回非零，调用方不得再 pause；真实异常写日志
+menu_pick() {
+  local header="$1"
+  shift
+  local result
+  local rc
+
+  result=$(gum choose --header "$header" "$@" 2>/dev/tty)
+  rc=$?
+
+  if [ "$rc" -ne 0 ] || [ -z "$result" ]; then
+    if [ "$rc" -eq 1 ] || [ "$rc" -ge 128 ]; then
+      # 正常取消 / Ctrl+C：擦掉 gum 留下的那一行提示
+      printf '\033[1A\033[2K' > /dev/tty 2>/dev/null || true
+    elif [ "$rc" -ne 0 ]; then
+      ag_log ERROR "gum choose rc=$rc"
+    fi
+    return 1
+  fi
+
+  printf '%s\n' "$result"
+}
+
+menu_pause() {
+  pause
+}
+
+# ------------------------------------------------------------
+# ag v2.4：runtime-state sidecar 记录（失败静默，不影响启动）
+# ------------------------------------------------------------
+v24_record_runtime() {
+  local dir="$1"
+  local launcher="$2"
+  local launch_mode="${3:-standard}"
+  local session="$4"
+  local key rt_id
+
+  have ag-run || return 0
+  key=$(launcher_key "$launcher") || return 0
+  [ "$key" != 'shell' ] || return 0
+
+  rt_id=$(ag-run record-launch --provider "$key" --mode "$launch_mode" \
+    --session "$session" --cwd "$dir" 2>/dev/null) || {
+    ag_log WARN "v2.4 runtime record 失败（不影响启动）：$key/$session/$dir"
+    return 0
+  }
+
+  if [ -n "$rt_id" ]; then
+    tmux set-option -q -t "=$session:" @ag_runtime_id "$rt_id" 2>/dev/null || true
+    tmux set-option -q -p -t "=$session:0.0" @ag_provider "$key" 2>/dev/null || true
+    tmux set-option -q -p -t "=$session:0.0" @ag_mode "$launch_mode" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# ag v2.4：runtime 只读诊断（PASS/WARN/FAIL，不做任何修改）
+cmd_doctor_v24() {
+  if have ag-run; then
+    ag-run doctor
+  else
+    echo "❌ FAIL ag-run               ag v2.4 runtime 未安装（v2.3 功能不受影响）"
+  fi
+}
+
+# ------------------------------------------------------------
+# Agent 会话创建（兼容旧命名；v2.3.2 以 tmux identity 决定复用）
+# ------------------------------------------------------------
+
+launch_command_for() {
+  local launcher="$1"
+  local launch_mode="${2:-standard}"
+  local key resolved args
+
+  # ag v2.4：优先经 ag-run resolve（capability probe 感知）取实际 flags，
+  # 消除与 providers/*.py 的双份映射；ag-run/jq 异常时回退本地映射（方向只降不升）
+  key=$(launcher_key "$launcher" 2>/dev/null) || key=''
+  if [ -n "$key" ] && [ "$key" != 'shell' ] && have ag-run && have jq; then
+    if resolved=$(ag-run resolve "$key" --mode "$launch_mode" 2>/dev/null); then
+      if printf '%s' "$resolved" | jq -e 'type=="object" and (.args|type)=="array"' >/dev/null 2>&1; then
+        args=$(printf '%s' "$resolved" | jq -r '.args | join(" ")')
+        if [ -n "$args" ]; then
+          printf '%s %s' "$key" "$args"
+        else
+          printf '%s' "$key"
+        fi
+        return 0
+      fi
+    fi
+  fi
+
+  case "$launcher:$launch_mode" in
+    Codex:standard) printf 'codex' ;;
+    Codex:assisted) printf 'codex --approve-for-me --sandbox workspace-write' ;;
+    Codex:yolo) printf 'codex --dangerously-bypass-approvals-and-sandbox' ;;
+    Claude:standard) printf 'claude' ;;
+    Claude:assisted) printf 'claude --permission-mode auto' ;;
+    Claude:yolo) printf 'claude --permission-mode bypassPermissions' ;;
+    Shell:standard) printf '' ;;
+    *) return 1 ;;
+  esac
+}
+
+launch_mode_label() {
+  case "${1:-standard}" in
+    standard) printf '标准模式（SAFE）' ;;
+    assisted) printf '少打断模式（AUTO）' ;;
+    yolo) printf 'YOLO 模式（Trusted Only）' ;;
+    *) return 1 ;;
+  esac
+}
+
+launch_mode_pick() {
+  local launcher="$1"
+  local selected
+
+  [ "$launcher" != 'Shell' ] || { printf 'standard'; return 0; }
+  selected=$(menu_pick "$launcher 权限模式" \
+    "标准模式（SAFE · 按需确认权限）" \
+    "少打断模式（AUTO · 保留安全边界）" \
+    "YOLO 模式（仅信任项目 · 自动过闸门）" \
+    "返回") || return 1
+
+  case "$selected" in
+    "标准模式"*) printf 'standard' ;;
+    "少打断模式"*) printf 'assisted' ;;
+    "YOLO 模式"*) printf 'yolo' ;;
+    *) return 1 ;;
+  esac
+}
+
+start_agent_in_session() {
+  local name="$1"
+  local launcher="$2"
+  local launch_mode="${3:-standard}"
+  local command
+
+  command=$(launch_command_for "$launcher" "$launch_mode") || {
+    echo "错误：未知启动模式：$launcher/$launch_mode"
+    return 1
+  }
+
+  case "$launcher" in
+    Codex)
+      if ! have codex; then
+        echo "错误：PATH 中没有找到 codex。"
+        return 1
+      fi
+      tmux send-keys -t "=$name:" "$command" C-m
+      ;;
+
+    Claude)
+      if ! have claude; then
+        echo "错误：PATH 中没有找到 claude。"
+        return 1
+      fi
+      tmux send-keys -t "=$name:" "$command" C-m
+      ;;
+
+    Shell)
+      ;;
+    *)
+      echo "错误：未知启动方式：$launcher"
+      return 1
+      ;;
+  esac
+}
+
+create_session_for_dir() {
+  local dir="$1"
+  local launcher="$2"
+  local requested_name="${3:-}"
+  local launch_mode="${4:-standard}"
+
+  local base
+  local name
+  local project_id
+
+  dir=$(canonical_dir "$dir") || {
+    echo "目录不存在：$dir"
+    pause
+    return 1
+  }
+
+  # ag v2.4：YOLO 策略闸门（白名单放行：只有明确 ALLOW 才保持 YOLO；
+  # DENY 或 gate 不可用（ag-run 缺失/异常/输出为空）一律降级 AUTO，fail-safe）
+  if [ "$launch_mode" = 'yolo' ]; then
+    local gate_result
+    gate_result=''
+    if have ag-run; then
+      gate_result=$(ag-run gate "$(launcher_key "$launcher")" --cwd "$dir" 2>/dev/null) || gate_result=''
+    fi
+    case "$gate_result" in
+      ALLOW) ;;
+      DENY:*)
+        echo "⚠️ YOLO gate：${gate_result#DENY:} —— 自动降级为少打断模式（AUTO）。"
+        launch_mode='assisted'
+        ;;
+      *)
+        echo "⚠️ YOLO gate 不可用（ag-run 缺失或异常）—— fail-safe 自动降级为少打断模式（AUTO）。"
+        launch_mode='assisted'
+        ;;
+    esac
+  fi
+
+  if [ -n "$requested_name" ]; then
+    base=$(sanitize_name "$requested_name")
+  else
+    base=$(sanitize_name "$(basename "$dir")")
+  fi
+
+  # 纯中文等 slug 化为空 → 用 registry id 前 6 位兜底
+  if [ -z "$base" ]; then
+    base=$(registry_id_for_path "$dir" | cut -c1-6)
+  fi
+
+  [ -n "$base" ] || base='agent'
+
+  project_id=$(registry_id_for_path "$dir") || {
+    echo "无法生成项目标识：$dir"
+    pause
+    return 1
+  }
+
+  name=$(unique_session_name "$base" "$dir" "$launcher" "$launch_mode") || {
+    echo "无法生成 tmux 会话名称。"
+    pause
+    return 1
+  }
+
+  if session_exists "$name"; then
+    if session_identity_matches "$name" "$project_id" "$dir" &&
+       session_agent_matches "$name" "$launcher" &&
+       session_launch_mode_matches "$name" "$launch_mode"; then
+      echo
+      echo "Session '$name' 已存在，直接进入。"
+      session_set_identity "$name" "$project_id" "$dir" "$launcher" "$launch_mode" ||
+        echo "⚠️ 无法写入会话身份元数据，已按兼容模式继续。"
+      set_current_project "$dir" || true
+      ag_add_recent_project "$dir"
+      ag_log "reuse session=$name dir=$dir"
+      registry_record_start "$dir" "$launcher" "$name" "$launch_mode" ||
+        echo "⚠️ 会话已进入，但项目 registry 更新失败；请运行 ag doctor。"
+      v24_record_runtime "$dir" "$launcher" "$launch_mode" "$name"
+      enter_session "$name"
+      return 0
+    fi
+  fi
+
+  case "$launcher" in
+    Codex)
+      have codex || { echo "错误：没有找到 codex。"; pause; return 1; }
+      ;;
+    Claude)
+      have claude || { echo "错误：没有找到 claude。"; pause; return 1; }
+      ;;
+    Shell)
+      ;;
+    *)
+      echo "错误：未知 launcher：$launcher"
+      pause
+      return 1
+      ;;
+  esac
+
+  if ! tmux new-session -d -s "$name" -c "$dir"; then
+    echo "错误：创建 tmux 会话失败：$name"
+    pause
+    return 1
+  fi
+
+  if ! session_set_identity "$name" "$project_id" "$dir" "$launcher" "$launch_mode"; then
+    tmux kill-session -t "=$name" 2>/dev/null || true
+    echo "错误：无法设置 tmux 会话身份元数据。"
+    pause
+    return 1
+  fi
+
+  if ! start_agent_in_session "$name" "$launcher" "$launch_mode"; then
+    tmux kill-session -t "=$name" 2>/dev/null || true
+    pause
+    return 1
+  fi
+
+  set_current_project "$dir" || true
+  ag_add_recent_project "$dir"
+  ag_log "start launcher=$launcher session=$name dir=$dir"
+  registry_record_start "$dir" "$launcher" "$name" "$launch_mode" ||
+    echo "⚠️ Agent 已启动，但项目 registry 更新失败；请运行 ag doctor。"
+  v24_record_runtime "$dir" "$launcher" "$launch_mode" "$name"
+
+  echo
+  echo "已创建："
+  echo
+  echo "  Session : $name"
+  echo "  Agent   : $launcher"
+  echo "  Path    : $(pretty_path "$dir")"
+  echo
+
+  enter_session "$name"
+}
+
+# ------------------------------------------------------------
+# 项目选择（Agent 启动用）
+# ------------------------------------------------------------
+
+# 从最近项目里选一个目录（含外置盘保护与失效清理）
+pick_from_recent() {
+  local line
+  local parent
+  local warned=0
+  local removed
+  local -a items=()
+  local -a targets=()
+  local i
+  local sel
+  local picked
+
+  [ -s "$AG_RECENT_FILE" ] || { echo "暂无最近项目记录。"; return 1; }
+
+  removed=""
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+
+    if [ -d "$line" ]; then
+      items+=("$(basename "$line")  —  $(pretty_path "$line")")
+      targets+=("$line")
+      continue
+    fi
+
+    parent=$(dirname "$line" 2>/dev/null || true)
+
+    if [ -n "$parent" ] && [ -d "$parent" ]; then
+      # 父目录可达而目录不存在 → 记录确实失效，自动清理
+      ag_remove_recent_project "$line"
+      removed="$removed
+⚠️ 项目目录不存在，已从最近项目中移除：$(pretty_path "$line")"
+      ag_log "cleanup removed=$(pretty_path "$line")"
+    else
+      # 父目录不可达（外置盘未挂载）→ 保留记录，绝不清理
+      if [ ! -d "$AG_ORICO_VOLUME" ] && [ "$warned" -eq 0 ]; then
+        case "$line" in
+          "$AG_ORICO_VOLUME"/*)
+            echo "⚠️ 外置盘 $AG_ORICO_VOLUME 未挂载，相关记录已保留，本次不清理任何记录。"
+            warned=1
+            ;;
+        esac
+      fi
+    fi
+  done < "$AG_RECENT_FILE"
+
+  [ -n "$removed" ] && printf '%s\n' "$removed"
+
+  if [ "${#targets[@]}" -eq 0 ]; then
+    echo "暂无当前可用的最近项目（外置盘可能未挂载）。"
+    return 1
+  fi
+
+  sel=$(menu_pick "最近项目" "${items[@]}") || return 1
+
+  picked=""
+  for i in "${!items[@]}"; do
+    if [ "${items[$i]}" = "$sel" ]; then
+      picked="${targets[$i]}"
+      break
+    fi
+  done
+
+  [ -n "$picked" ] || return 1
+  printf '%s' "$picked"
+}
+
+# Yazi 选目录（--cwd-file 机制；rc 检查 + 取消静默 + canonical 规范化）
+pick_with_yazi() {
+  local tmp
+  local selected
+  local rc
+
+  have yazi || { echo "错误：没有找到 yazi。"; return 1; }
+
+  tmp=$(mktemp "${TMPDIR:-/tmp}/ag3-yazi.XXXXXX") || return 1
+
+  yazi "$(ag_choose_default_root)" --cwd-file="$tmp"
+  rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$tmp"
+    ag_log WARN "yazi exited rc=$rc"
+    return 1
+  fi
+
+  selected=""
+  [ -s "$tmp" ] && selected=$(cat "$tmp")
+  rm -f "$tmp"
+
+  # 用户取消（未选择目录）→ 静默返回，调用方不再 pause
+  [ -n "$selected" ] || return 1
+
+  if [ ! -d "$selected" ]; then
+    ag_log ERROR "invalid yazi cwd: $selected"
+    return 1
+  fi
+
+  selected=$(canonical_dir "$selected") || return 1
+  printf '%s' "$selected"
+}
+
+# 为启动选择项目目录：当前项目 / 最近项目 / Yazi
+pick_project_for_launch() {
+  local cur
+  local choice
+  local dir
+
+  cur=$(current_project 2>/dev/null || true)
+
+  local -a opts=()
+  local -a vals=()
+
+  if [ -n "$cur" ] && [ -d "$cur" ]; then
+    opts+=("使用当前项目  —  $(pretty_path "$cur")")
+    vals+=("$cur")
+  fi
+  opts+=("从最近项目选择" "用 Yazi 选择目录")
+  vals+=("__recent__" "__yazi__")
+
+  choice=$(menu_pick "选择项目" "${opts[@]}") || return 1
+
+  local i
+  local v=""
+  for i in "${!opts[@]}"; do
+    [ "${opts[$i]}" = "$choice" ] && v="${vals[$i]}" && break
+  done
+
+  case "$v" in
+    __recent__)
+      pick_from_recent
+      ;;
+    __yazi__)
+      pick_with_yazi
+      ;;
+    *)
+      [ -n "$v" ] && printf '%s' "$v"
+      ;;
+  esac
+}
+
+# ------------------------------------------------------------
+# 恢复 Agent 会话（按面板进程识别）
+# ------------------------------------------------------------
+
+agent_session_candidates() {
+  local kind="$1"
+  local s
+  local cmd
+
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    cmd=$(session_command "$s")
+
+    case "$kind" in
+      codex)
+        if [ "$cmd" = "codex" ] || { [ "$cmd" = "node" ] && \
+          tmux capture-pane -p -t "=$s:" 2>/dev/null | head -40 | grep -qi 'codex'; }; then
+          printf '%s\t%s\t%s\n' "$s" "$cmd" "$(pretty_path "$(session_path "$s")")"
+        fi
+        ;;
+      claude)
+        if [ "$cmd" = "claude" ] || { [ "$cmd" = "node" ] && \
+          tmux capture-pane -p -t "=$s:" 2>/dev/null | head -40 | grep -qi 'claude'; }; then
+          printf '%s\t%s\t%s\n' "$s" "$cmd" "$(pretty_path "$(session_path "$s")")"
+        fi
+        ;;
+    esac
+  done < <(list_sessions_raw)
+}
+
+resume_agent_menu() {
+  local kind="$1"
+  local label="$2"
+  local -a items=()
+  local -a targets=()
+  local name
+  local i
+  local sel
+  local picked
+
+  if ! have tmux; then
+    echo "错误：没有找到 tmux。"
+    pause
+    return 0
+  fi
+
+  while IFS=$'\t' read -r name _cmd _path; do
+    [ -n "$name" ] || continue
+    items+=("$name  （${_cmd} · ${_path}）")
+    targets+=("$name")
+  done < <(agent_session_candidates "$kind")
+
+  if [ "${#targets[@]}" -eq 0 ]; then
+    echo
+    echo "暂无正在运行 $label 的会话。"
+    echo "可能 Agent 已退出，可通过 🤖 Agent → ${label} 新任务 重新启动，"
+    echo "或运行 ag session list 查看所有 tmux 会话。"
+    pause
+    return 0
+  fi
+
+  sel=$(menu_pick "恢复 $label" "${items[@]}") || return 0
+
+  picked=""
+  for i in "${!items[@]}"; do
+    [ "${items[$i]}" = "$sel" ] && picked="${targets[$i]}" && break
+  done
+
+  [ -n "$picked" ] || return 0
+
+  ag_log "resume kind=$kind session=$picked"
+  enter_session "$picked"
+}
+
+# ------------------------------------------------------------
+# Agent 菜单
+# ------------------------------------------------------------
+
+agent_menu() {
+  local c
+  local dir
+  local mode
+
+  while true; do
+    c=$(menu_pick "🤖 Agent" \
+      "Codex 新任务" "Claude 新任务" \
+      "恢复 Codex" "恢复 Claude" "返回") || return 0
+
+    case "$c" in
+      "Codex 新任务")
+        dir=$(pick_project_for_launch) || continue
+        [ -n "$dir" ] || continue
+        mode=$(launch_mode_pick Codex) || continue
+        gum confirm "在 $(pretty_path "$dir") 启动 Codex（$(launch_mode_label "$mode")）？" &&
+          create_session_for_dir "$dir" Codex "" "$mode"
+        ;;
+      "Claude 新任务")
+        dir=$(pick_project_for_launch) || continue
+        [ -n "$dir" ] || continue
+        mode=$(launch_mode_pick Claude) || continue
+        gum confirm "在 $(pretty_path "$dir") 启动 Claude（$(launch_mode_label "$mode")）？" &&
+          create_session_for_dir "$dir" Claude "" "$mode"
+        ;;
+      "恢复 Codex")
+        resume_agent_menu codex "Codex"
+        ;;
+      "恢复 Claude")
+        resume_agent_menu claude "Claude"
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------
+# 新建项目（Yazi 任选父目录 + registry 落盘）
+# ------------------------------------------------------------
+
+project_normalize_name() {
+  printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+project_validate_name() {
+  local name
+
+  name=$(project_normalize_name "$1")
+
+  [ -n "$name" ] || return 1
+  [ "$name" != "." ] || return 1
+  [ "$name" != ".." ] || return 1
+
+  case "$name" in
+    */*) return 1 ;;
+  esac
+
+  # 控制字符拒绝
+  if printf '%s' "$name" | grep -q '[[:cntrl:]]'; then
+    return 1
+  fi
+
+  return 0
+}
+
+project_open_existing() {
+  local target="$1"
+
+  set_current_project "$target" || true
+  ag_add_recent_project "$target"
+  ag_log "project opened dir=$target"
+  echo
+  echo "✅ 当前项目已设置：$(pretty_path "$target")"
+  echo "ℹ️ 启动 Agent 请到 🤖 Agent 菜单。"
+  pause
+}
+
+project_post_create_menu() {
+  local name="$1"
+  local target="$2"
+  local sel
+  local mode
+
+  set_current_project "$target" || true
+  ag_add_recent_project "$target"
+  ag_log "project created dir=$target"
+
+  sel=$(menu_pick "创建完成后的动作" \
+    "Codex" "Claude" "仅创建项目" "Yazi 打开" "返回") || return 0
+
+  case "$sel" in
+    "Codex")
+      mode=$(launch_mode_pick Codex) || return 0
+      create_session_for_dir "$target" Codex "" "$mode"
+      ;;
+    "Claude")
+      mode=$(launch_mode_pick Claude) || return 0
+      create_session_for_dir "$target" Claude "" "$mode"
+      ;;
+    "Yazi 打开")
+      have yazi && yazi "$target"
+      ;;
+    *)
+      echo "ℹ️ 已按『仅创建项目』处理（registry: parked）。启动 Agent 请到 🤖 Agent 菜单。"
+      pause
+      ;;
+  esac
+}
+
+project_create() {
+  local parent=""
+  local name
+  local target
+  local sel
+
+  while true; do
+    # ---- 外层：选择父目录 ----
+    while true; do
+      sel=$(menu_pick "请选择项目父目录" \
+        "Yazi 选择目录" "当前目录" "返回") || return 0
+
+      case "$sel" in
+        "Yazi 选择目录")
+          parent=$(pick_with_yazi) || continue
+          ;;
+        "当前目录")
+          parent="$PWD"
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+      break
+    done
+
+    if [ ! -d "$parent" ]; then
+      echo "父目录不可用：$parent"
+      pause
+      continue
+    fi
+
+    # ---- 内层：输入名称 + 同名处理 ----
+    while true; do
+      # gum input 取消时留一行 "not submitted"，同样擦除
+      name=$(gum input --header "父目录：$(pretty_path "$parent")" \
+        --placeholder "新项目名称" 2>/dev/tty) || {
+        printf '\033[1A\033[2K' > /dev/tty 2>/dev/null || true
+        return 0
+      }
+
+      name=$(project_normalize_name "$name")
+      if ! project_validate_name "$name"; then
+        echo "项目名称无效，请重新输入。"
+        pause
+        continue
+      fi
+
+      target="$parent/$name"
+
+      if [ -d "$target" ]; then
+        sel=$(menu_pick "项目已存在：$(pretty_path "$target")" \
+          "打开现有项目" "换一个名称" "重新选择父目录" "返回") || return 0
+
+        case "$sel" in
+          "打开现有项目")
+            project_open_existing "$target"
+            return 0
+            ;;
+          "换一个名称")
+            continue
+            ;;
+          "重新选择父目录")
+            break
+            ;;
+          *)
+            return 0
+            ;;
+        esac
+      elif [ -e "$target" ]; then
+        echo "同名文件已存在，无法创建：$(pretty_path "$target")"
+        pause
+        continue
+      else
+        if ! mkdir "$target" 2>/dev/null; then
+          ag_log ERROR "mkdir failed: $target"
+          echo "创建失败：$(pretty_path "$target")"
+          pause
+          continue
+        fi
+
+        target=$(canonical_dir "$target") || return 1
+
+        if ! registry_create "$name" "$target"; then
+          ag_log ERROR "registry create failed: $target" || true
+          echo "⚠️ 项目目录已创建，但 registry 写入失败；请运行 ag doctor。"
+        fi
+
+        echo
+        echo "✅ 项目创建成功：$(pretty_path "$target")"
+        echo "ℹ️ AG 只负责建立目录；git/npm/uv 初始化交给 Agent。"
+        echo
+
+        project_post_create_menu "$name" "$target"
+        return 0
+      fi
+    done
+  done
+}
+
+# ------------------------------------------------------------
+# 项目菜单
+# ------------------------------------------------------------
+
+project_menu() {
+  local c
+  local dir
+  local launcher
+  local mode
+  local cur
+
+  while true; do
+    c=$(menu_pick "📁 项目" \
+      "最近项目" "Yazi 选择项目" "当前项目" "新建项目" "返回") || return 0
+
+    case "$c" in
+      "最近项目")
+        dir=$(pick_from_recent) || continue
+        launcher=$(menu_pick "启动什么" "Codex" "Claude" "Shell") || continue
+        mode=$(launch_mode_pick "$launcher") || continue
+        create_session_for_dir "$dir" "$launcher" "" "$mode"
+        ;;
+      "Yazi 选择项目")
+        dir=$(pick_with_yazi) || continue
+        set_current_project "$dir" || true
+        ag_add_recent_project "$dir"
+        ag_log "project set dir=$dir source=yazi"
+        echo
+        echo "✅ 当前项目已设置：$(pretty_path "$dir")"
+        pause
+        ;;
+      "当前项目")
+        cur=$(current_project 2>/dev/null || true)
+        echo
+        if [ -n "$cur" ]; then
+          echo "当前项目：$(pretty_path "$cur")"
+          [ -d "$cur" ] || echo "⚠️ 该目录当前不存在（外置盘可能未挂载）。"
+        else
+          echo "尚未设置当前项目。"
+        fi
+        pause
+        ;;
+      "新建项目")
+        project_create
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------
+# 开发菜单
+# ------------------------------------------------------------
+
+justfile_in() {
+  local dir="$1"
+  if [ -f "$dir/justfile" ]; then
+    printf '%s' "$dir/justfile"
+  elif [ -f "$dir/Justfile" ]; then
+    printf '%s' "$dir/Justfile"
+  else
+    return 1
+  fi
+}
+
+just_has_recipe() {
+  local jf="$1"
+  local recipe="$2"
+  have just || return 1
+  just --justfile "$jf" --summary 2>/dev/null | tr ' ' '\n' | grep -qx "$recipe"
+}
+
+require_current_project() {
+  cur=$(current_project 2>/dev/null || true)
+  if [ -z "$cur" ]; then
+    echo "ℹ️ 尚未设置当前项目，请先到 📁 项目 菜单选择。"
+    pause
+    return 1
+  fi
+  if [ ! -d "$cur" ]; then
+    echo "⚠️ 当前项目目录不存在（外置盘可能未挂载）：$(pretty_path "$cur")"
+    pause
+    return 1
+  fi
+  printf '%s' "$cur"
+}
+
+dev_menu() {
+  local cur
+  local jf
+
+  while true; do
+    c=$(menu_pick "🛠 开发" \
+      "Git" "Docker" "测试" "完整检查" "安全扫描" \
+      "GitHub Actions" "开发监听" "项目分析" "性能测试" "返回") || return 0
+
+    case "$c" in
+      "Git")
+        cur=$(require_current_project) || continue
+        if ! (cd "$cur" && git rev-parse --is-inside-work-tree >/dev/null 2>&1); then
+          echo "ℹ️ 当前项目不是 Git 仓库。"
+          pause
+          continue
+        fi
+        (cd "$cur" && lazygit)
+        ;;
+      "Docker")
+        if ! docker info >/dev/null 2>&1; then
+          echo "ℹ️ Docker 当前不可用，请检查 Docker Desktop。"
+          pause
+          continue
+        fi
+        lazydocker
+        ;;
+      "测试")
+        cur=$(require_current_project) || continue
+        if ! jf=$(justfile_in "$cur"); then
+          echo "ℹ️ 当前项目尚未定义 justfile。"
+          echo "   建议让 Agent 为项目建立标准 justfile（test/lint/check/security/watch）。"
+          pause
+          continue
+        fi
+        if just_has_recipe "$jf" test; then
+          just --justfile "$jf" test
+        else
+          echo "ℹ️ 当前项目尚未定义 \`just test\`。"
+        fi
+        pause
+        ;;
+      "完整检查")
+        cur=$(require_current_project) || continue
+        if ! jf=$(justfile_in "$cur"); then
+          echo "ℹ️ 当前项目尚未定义 justfile，无法执行 just check。"
+          pause
+          continue
+        fi
+        if just_has_recipe "$jf" check; then
+          just --justfile "$jf" check
+        else
+          echo "ℹ️ 当前项目尚未定义 \`just check\`。"
+        fi
+        pause
+        ;;
+      "安全扫描")
+        cur=$(require_current_project) || continue
+        if jf=$(justfile_in "$cur") && just_has_recipe "$jf" security; then
+          just --justfile "$jf" security
+        else
+          have trivy || { echo "错误：没有找到 trivy。"; pause; continue; }
+          echo "（使用 trivy 直接扫描，只生成结果，不做任何修改）"
+          trivy fs --scanners vuln,secret,misconfig "$cur"
+        fi
+        pause
+        ;;
+      "GitHub Actions")
+        cur=$(require_current_project) || continue
+        if [ ! -d "$cur/.github/workflows" ]; then
+          echo "ℹ️ 当前项目没有 GitHub Actions。"
+          pause
+          continue
+        fi
+        gum confirm "act 首次运行可能下载较大的 Docker 镜像，继续？" &&
+          (cd "$cur" && act)
+        ;;
+      "开发监听")
+        cur=$(require_current_project) || continue
+        if jf=$(justfile_in "$cur") && just_has_recipe "$jf" watch; then
+          just --justfile "$jf" watch
+        else
+          echo "ℹ️ 当前项目尚未定义 \`just watch\`。"
+        fi
+        pause
+        ;;
+      "项目分析")
+        cur=$(require_current_project) || continue
+        echo "--- Git 状态 ---"
+        (cd "$cur" && git status --short 2>/dev/null || echo "（非 Git 仓库）")
+        echo
+        echo "--- 代码规模 ---"
+        scc "$cur" 2>/dev/null | head -20
+        pause
+        ;;
+      "性能测试")
+        cur=$(require_current_project) || continue
+        if jf=$(justfile_in "$cur") && just_has_recipe "$jf" bench; then
+          just --justfile "$jf" bench
+        else
+          echo "ℹ️ 当前项目未定义 benchmark。"
+          echo "   如需要性能测试，可让 Agent 使用 hyperfine 配置 \`just bench\`。"
+        fi
+        pause
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------
+# 会话中心（runtime 实时计算，不落盘）
+# ------------------------------------------------------------
+
+pretty_time_ago() {
+  local iso="$1"
+  local ts_epoch
+  local now_epoch
+  local diff
+
+  ts_epoch=$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "$iso" '+%s' 2>/dev/null) || {
+    printf '%s' "$iso"
+    return 0
+  }
+
+  now_epoch=$(date '+%s')
+  diff=$((now_epoch - ts_epoch))
+
+  if [ "$diff" -lt 0 ]; then
+    printf '%s' "$iso"
+  elif [ "$diff" -lt 60 ]; then
+    echo "刚刚"
+  elif [ "$diff" -lt 3600 ]; then
+    echo "$((diff / 60))分钟前"
+  elif [ "$diff" -lt 86400 ]; then
+    echo "$((diff / 3600))小时前"
+  else
+    echo "$((diff / 86400))天前"
+  fi
+}
+
+# 两态视图：只有 identity-matching 的 tmux 会话属于正在运行；其余
+# 项目（包括旧 parked 和已意外退出的 active）都归入已完成。
+project_visible_state() {
+  local id="$1"
+  local ts="$2"
+  local path="$3"
+
+  if registry_project_running "$id" "$ts" "$path"; then
+    printf 'running'
+  else
+    printf 'completed'
+  fi
+}
+
+session_center_scan() {
+  local all
+  local dup_list
+  local id name _lc _agent ts path
+  local short
+  local visible
+  local badge
+  local v24_summary
+
+  run_n=0; done_n=0
+  run_ids=(); run_items=()
+  done_ids=(); done_items=()
+  center_ids=()
+  center_items=()
+
+  # ag v2.4：会话中心打开时刷新 runtime 状态（失败静默降级 v2.3）
+  if have ag-run; then
+    ag-run refresh --quiet >/dev/null 2>&1 || true
+    v24_summary=$(ag-run state-summary 2>/dev/null || true)
+  else
+    v24_summary=''
+  fi
+
+  all=$(registry_iter)
+
+  # 重名项目在展示时补父目录后缀
+  dup_list=$(printf '%s\n' "$all" | awk -F'\t' '{print $2}' | sort | uniq -d)
+
+  while IFS=$'\t' read -r id name _lc _agent ts path; do
+    [ -n "$id" ] || continue
+
+    short="$name"
+    if printf '%s\n' "$dup_list" | grep -qxF -- "$name"; then
+      short="$name · $(basename "$(dirname "$path")")"
+    fi
+
+    # ag v2.4：runtime 徽标（cwd 最长前缀匹配；无记录则不显示）
+    badge=$(printf '%s\n' "$v24_summary" | \
+      awk -F'\t' -v p="$path" '$1 != "" && (p == $1 || index(p, $1 "/") == 1) {print $2 "·" $3 "·" $4; exit}')
+
+    visible=$(project_visible_state "$id" "$ts" "$path")
+    if [ "$visible" = 'running' ]; then
+      run_n=$((run_n + 1))
+      run_ids+=("$id")
+      run_items+=("● $short${badge:+ ｜ $badge}")
+    else
+      done_n=$((done_n + 1))
+      done_ids+=("$id")
+      done_items+=("✓ $short${badge:+ ｜ $badge}")
+    fi
+  done <<EOF
+$all
+EOF
+}
+
+session_center() {
+  local sel
+  local pid
+  local i
+
+  while true; do
+    session_center_scan
+
+    sel=$(menu_pick "会话中心" \
+      "● 正在运行  ${run_n}" \
+      "✓ 已完成    ${done_n}" \
+      "返回") || return 0
+
+    case "$sel" in
+      "●"*)
+        center_ids=("${run_ids[@]}")
+        center_items=("${run_items[@]}")
+        ;;
+      "✓"*)
+        center_ids=("${done_ids[@]}")
+        center_items=("${done_items[@]}")
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+
+    if [ "${#center_ids[@]}" -eq 0 ]; then
+      echo "（此分类当前没有项目）"
+      pause
+      continue
+    fi
+
+    sel=$(menu_pick "项目列表" "${center_items[@]}") || continue
+
+    pid=""
+    for i in "${!center_items[@]}"; do
+      if [ "${center_items[$i]}" = "$sel" ]; then
+        pid="${center_ids[$i]}"
+        break
+      fi
+    done
+
+    [ -n "$pid" ] && project_detail "$pid"
+  done
+}
+
+project_detail() {
+  local id="$1"
+  local name agent ts path last
+  local running
+  local -a opts=()
+  local sel
+  local mode
+
+  while true; do
+    name=$(registry_get "$id" "name")
+    agent=$(registry_get "$id" "agent")
+    ts=$(registry_get "$id" "tmux_session")
+    path=$(registry_get "$id" "path")
+    last=$(registry_get "$id" "last_active_at")
+
+    [ -n "$agent" ] || agent="none"
+
+    running=0
+    if registry_project_running "$id" "$ts" "$path"; then
+      running=1
+    fi
+
+    echo
+    echo "── $name ─────────────────────"
+    echo "Agent : $agent"
+    if [ "$running" -eq 1 ]; then
+      echo "状态  : ● 正在运行（tmux: ${ts}）"
+    else
+      echo "状态  : ✓ 已完成"
+    fi
+    echo "目录  : $(pretty_path "$path")"
+
+    if [ ! -d "$path" ]; then
+      case "$path" in
+        "$AG_ORICO_VOLUME"/*)
+          if [ ! -d "$AG_ORICO_VOLUME" ]; then
+            echo "⚠️ 外置盘 $AG_ORICO_VOLUME 未挂载，路径当前不可用（记录已保留）"
+          fi
+          ;;
+        *)
+          echo "⚠️ 路径当前不存在（记录已保留，绝不自动清理）"
+          ;;
+      esac
+    fi
+
+    if [ -n "$last" ] && [ "$last" != "null" ]; then
+      echo "活跃  : $(pretty_time_ago "$last")"
+    fi
+    echo
+
+    opts=()
+    if [ "$running" -eq 1 ]; then
+      opts+=("进入会话" "结束项目（关闭会话并标记已完成）")
+    else
+      opts+=("重新启动 Codex" "重新启动 Claude")
+    fi
+    opts+=("Yazi 打开目录")
+    opts+=("返回")
+
+    sel=$(menu_pick "项目详情" "${opts[@]}") || return 0
+
+    case "$sel" in
+      "进入会话")
+        enter_session "$ts"
+        return 0
+        ;;
+      "重新启动 Codex")
+        mode=$(launch_mode_pick Codex) || continue
+        create_session_for_dir "$path" Codex "" "$mode"
+        return 0
+        ;;
+      "重新启动 Claude")
+        mode=$(launch_mode_pick Claude) || continue
+        create_session_for_dir "$path" Claude "" "$mode"
+        return 0
+        ;;
+      "Yazi 打开目录")
+        if [ -d "$path" ]; then
+          yazi "$path"
+        else
+          echo "目录当前不可用。"
+          pause
+        fi
+        ;;
+      "结束项目（关闭会话并标记已完成）")
+        project_finish "$id" || continue
+        return 0
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
+project_finish() {
+  local id="$1"
+  local ts
+  local path
+  local cur=""
+
+  ts=$(registry_get "$id" "tmux_session")
+  path=$(registry_get "$id" "path")
+  if ! registry_project_running "$id" "$ts" "$path"; then
+    echo "会话已退出；项目已按完成状态显示。"
+    pause
+    return 0
+  fi
+
+  if [ -n "${TMUX:-}" ]; then
+    cur=$(tmux display-message -p '#S' 2>/dev/null || true)
+  fi
+  if [ "$cur" = "$ts" ]; then
+    echo "⚠️ 注意：你当前就在该会话中，关闭后会回到外层终端。"
+  fi
+
+  gum confirm "确认结束项目？将关闭 tmux 会话 '$ts' 并标记为已完成。" || return 0
+
+  if ! tmux kill-session -t "=$ts" 2>/dev/null; then
+    echo "关闭 tmux 会话失败；项目未标记完成：$ts"
+    pause
+    return 1
+  fi
+  if ! registry_set_field "$id" "lifecycle" "done"; then
+    echo "tmux 会话已关闭，但项目状态写入失败；请运行 ag doctor。"
+    pause
+    return 1
+  fi
+  ag_log "project finished id=$id session=$ts"
+  echo "项目已完成并关闭会话：$ts"
+  pause
+  return 0
+}
+
+# ------------------------------------------------------------
+# 工作台菜单
+# ------------------------------------------------------------
+
+agentboard_alive() {
+  lsof -nP -iTCP:"$AG_AGENTBOARD_PORT" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+disk_menu() {
+  local target
+  local cur
+
+  target=$(menu_pick "磁盘分析目标" "Home" "当前项目" "ORICO 盘") || return 0
+
+  case "$target" in
+    "Home")
+      target="$HOME"
+      ;;
+    "当前项目")
+      cur=$(current_project 2>/dev/null || true)
+      if [ -z "$cur" ] || [ ! -d "$cur" ]; then
+        echo "ℹ️ 尚未设置有效的当前项目。"
+        pause
+        return 0
+      fi
+      target="$cur"
+      ;;
+    "ORICO 盘")
+      if [ ! -d "$AG_ORICO_VOLUME" ]; then
+        echo "⚠️ 外置盘 $AG_ORICO_VOLUME 未挂载。"
+        pause
+        return 0
+      fi
+      target="$AG_ORICO_VOLUME"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  have dust || { echo "错误：没有找到 dust。"; pause; return 0; }
+  dust -d 1 "$target"
+  pause
+}
+
+workstation_menu() {
+  while true; do
+    c=$(menu_pick "🖥 工作台" \
+      "Agentboard" "会话中心" "Runtime 诊断" "Project Policy" \
+      "Agent Monitor" "Trace" "Usage" "系统监控" "磁盘分析" \
+      "工作台状态" "工作台诊断" "查看日志" "返回") || return 0
+
+    case "$c" in
+      "Agentboard")
+        echo
+        if agentboard_alive; then
+          echo "✅ Agentboard :$AG_AGENTBOARD_PORT 正常"
+        else
+          echo "❌ Agentboard :$AG_AGENTBOARD_PORT 离线"
+          echo "ℹ️ 它由 launchd 服务 $AG_AGENTBOARD_LABEL 守护（KeepAlive）。"
+          echo "   请检查该服务；AG 不会启动第二个实例。"
+        fi
+        pause
+        ;;
+      "会话中心")
+        session_center
+        ;;
+      "Runtime 诊断")
+        echo
+        cmd_doctor_v24
+        pause
+        ;;
+      "Project Policy")
+        echo
+        if have ag-policy; then
+          ag-policy show
+        else
+          echo "ℹ️ ag-policy 未安装（ag v2.4 runtime 缺失）。"
+        fi
+        pause
+        ;;
+      "Agent Monitor")
+        # abtop：只读 agent 监控（htop for agents），退出不影响任何 Agent
+        if have abtop; then
+          abtop
+        else
+          echo "ℹ️ abtop 未安装（批次 C 旁路工具）。"
+          pause
+        fi
+        ;;
+      "Trace")
+        # codex-trace：只读 session 查看器（Docker 旁路，端口以实际启动日志为准）
+        if curl -s -m 2 -o /dev/null http://127.0.0.1:1422/; then
+          open http://127.0.0.1:1422/
+          echo "已在浏览器打开 codex-trace。"
+          pause
+        else
+          echo "ℹ️ codex-trace 未在运行。启动方式："
+          echo "  docker run --rm -p 127.0.0.1:1422:1422 \\"
+          echo "    -v \"\$HOME/.codex/sessions:/home/app/.codex/sessions:ro\" codex-trace"
+          pause
+        fi
+        ;;
+      "Usage")
+        echo
+        if have ag-run; then
+          ag-run usage
+          have codexbar && echo && echo "（菜单栏额度：CodexBar；本列表为 ag 侧历史快照）"
+        else
+          echo "ℹ️ ag-run 未安装。"
+        fi
+        pause
+        ;;
+      "系统监控")
+        have btop && btop
+        ;;
+      "磁盘分析")
+        disk_menu
+        ;;
+      "工作台状态")
+        echo
+        if [ -x "$HOME/.local/bin/mac-status" ]; then
+          "$HOME/.local/bin/mac-status"
+        else
+          show_status
+        fi
+        pause
+        ;;
+      "工作台诊断")
+        echo
+        cmd_doctor
+        echo
+        if [ -x "$HOME/.local/bin/mac-fix" ]; then
+          gum confirm "是否运行 mac-fix 进行基础修复？（其内部动作均需再次确认）" &&
+            "$HOME/.local/bin/mac-fix"
+        else
+          echo "ℹ️ mac-fix 不存在，跳过修复入口。"
+        fi
+        pause
+        ;;
+      "查看日志")
+        echo
+        if [ -f "$AG_LOG_FILE" ]; then
+          tail -n 50 "$AG_LOG_FILE"
+        else
+          echo "（暂无日志：${AG_LOG_FILE}）"
+        fi
+        pause
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------
+# 辅助菜单
+# ------------------------------------------------------------
+
+assist_menu() {
+  while true; do
+    c=$(menu_pick "🧠 辅助" "历史命令" "Shell" "返回") || return 0
+
+    case "$c" in
+      "历史命令")
+        if have atuin; then
+          atuin search -i
+        else
+          echo "ℹ️ atuin 未安装。"
+          pause
+        fi
+        ;;
+      "Shell")
+        "${SHELL:-/bin/zsh}"
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------
+# 非交互子命令
+# ------------------------------------------------------------
+
+show_status() {
+  local cur
+  local n
+
+  cur=$(current_project 2>/dev/null || true)
+  if [ -n "$cur" ]; then
+    echo "Current Project : $(basename "$cur") ($(pretty_path "$cur"))"
+  else
+    echo "Current Project : (未设置)"
+  fi
+
+  if agentboard_alive; then
+    echo "Agentboard      : ✅ :$AG_AGENTBOARD_PORT"
+  else
+    echo "Agentboard      : ❌ 离线"
+  fi
+
+  if docker info >/dev/null 2>&1; then
+    n=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+    echo "Docker          : ✅ ($n 个容器运行中)"
+  else
+    echo "Docker          : ❌ 不可用"
+  fi
+
+  if have tmux; then
+    echo "tmux sessions   : $(list_sessions_raw | tr '\n' ' ')"
+  else
+    echo "tmux sessions   : ❌ tmux 不可用"
+  fi
+
+  have codex && echo "Codex           : $(codex --version 2>/dev/null | head -1)"
+  have claude && echo "Claude          : $(claude --version 2>/dev/null | head -1)"
+
+  echo "Disk /          : $(df -h / 2>/dev/null | awk 'NR==2{print $4" 可用"}')"
+  if [ -d "$AG_ORICO_VOLUME" ]; then
+    echo "ORICO           : ✅ 已挂载"
+  else
+    echo "ORICO           : ⚠️ 未挂载"
+  fi
+
+  agent_ws_status_block
+}
+
+cmd_status() {
+  show_status
+}
+
+cmd_doctor() {
+  local t
+  local ok=0
+  local warn=0
+  local hard=0
+  local probe
+  local probe_lower
+  local probe_rc
+  local reg_n=0
+  local reg_bad=0
+  local reg_f
+  local cur
+
+  echo "=== ag doctor（只读诊断，不做任何修改） ==="
+  echo
+
+  echo "--- 核心依赖 ---"
+  for t in gum tmux jq yazi shasum codex claude; do
+    if have "$t"; then
+      printf '✅ %s\n' "$t"
+      ok=$((ok + 1))
+    else
+      printf '❌ %s 未安装（核心功能受限）\n' "$t"
+      hard=$((hard + 1))
+    fi
+  done
+
+  echo
+  echo "--- 可选工具 ---"
+  for t in atuin lazydocker watchexec trivy act lefthook dust hyperfine scc \
+           lazygit btop just git gh; do
+    if have "$t"; then
+      printf '✅ %s\n' "$t"
+      ok=$((ok + 1))
+    else
+      printf '⚠️ %s 未安装（对应菜单不可用）\n' "$t"
+      warn=$((warn + 1))
+    fi
+  done
+
+  echo
+  echo "--- 服务与环境 ---"
+
+  if ! have docker; then
+    echo "⚠️ Docker CLI 未安装（Docker 菜单不可用）"
+    warn=$((warn + 1))
+  else
+    probe=$(docker info 2>&1)
+    probe_rc=$?
+    if [ "$probe_rc" -eq 0 ]; then
+      echo "✅ Docker 可用"
+    else
+      probe_lower=$(printf '%s' "$probe" | tr '[:upper:]' '[:lower:]')
+      case "$probe_lower" in
+        *permission\ denied*|*operation\ not\ permitted*)
+          echo "⚠️ Docker socket 权限不足（当前诊断环境受限，不能据此判断服务离线）"
+          ;;
+        *)
+          echo "⚠️ Docker 不可用"
+          ;;
+      esac
+      warn=$((warn + 1))
+    fi
+  fi
+
+  if agentboard_alive; then
+    echo "✅ Agentboard :$AG_AGENTBOARD_PORT 在线"
+  else
+    echo "⚠️ Agentboard :${AG_AGENTBOARD_PORT} 离线（launchd: ${AG_AGENTBOARD_LABEL}）"
+    warn=$((warn + 1))
+  fi
+
+  if have tmux; then
+    probe=$(tmux info 2>&1)
+    probe_rc=$?
+    if [ "$probe_rc" -eq 0 ]; then
+      echo "✅ tmux 服务可达（$(list_sessions_raw | grep -c . || true) 个会话）"
+    else
+      probe_lower=$(printf '%s' "$probe" | tr '[:upper:]' '[:lower:]')
+      case "$probe_lower" in
+        *no\ server\ running*|*no\ sessions*)
+          echo "✅ tmux 已安装（当前无运行会话）"
+          ;;
+        *permission\ denied*|*operation\ not\ permitted*)
+          echo "⚠️ tmux socket 权限不足（当前诊断环境受限，不能据此判断服务离线）"
+          warn=$((warn + 1))
+          ;;
+        *)
+          echo "⚠️ tmux 服务不可达"
+          warn=$((warn + 1))
+          ;;
+      esac
+    fi
+  fi
+
+  if [ -d "$AG_ORICO_VOLUME" ]; then
+    echo "✅ 外置盘 $AG_ORICO_VOLUME 已挂载"
+  else
+    echo "⚠️ 外置盘 $AG_ORICO_VOLUME 未挂载（项目记录将被保留，不会清理）"
+    warn=$((warn + 1))
+  fi
+
+  echo
+  echo "--- 状态文件 ---"
+
+  if [ -d "$AG_STATE_DIR" ]; then
+    echo "✅ 状态目录 $AG_STATE_DIR"
+  else
+    echo "ℹ️ 状态目录尚未创建（首次写入时自动建立）：$AG_STATE_DIR"
+  fi
+
+  [ -f "$AG_RECENT_FILE" ] && echo "✅ recent-projects（$(grep -c . "$AG_RECENT_FILE" 2>/dev/null || echo 0) 条）" \
+    || echo "ℹ️ recent-projects 尚无记录"
+
+  if [ -d "$AG_REGISTRY_DIR" ]; then
+    for reg_f in "$AG_REGISTRY_DIR"/*.json; do
+      [ -f "$reg_f" ] || continue
+      reg_n=$((reg_n + 1))
+      if have jq && ! jq empty "$reg_f" >/dev/null 2>&1; then
+        reg_bad=$((reg_bad + 1))
+      fi
+    done
+    if [ "$reg_bad" -eq 0 ]; then
+      echo "✅ registry（${reg_n} 个项目，位于 ${AG_REGISTRY_DIR}）"
+    else
+      echo "❌ registry 有 ${reg_bad} 个损坏记录（共 ${reg_n} 个）"
+      hard=$((hard + 1))
+    fi
+  else
+    echo "ℹ️ registry 尚未创建（首次新建/启动项目时生成）"
+  fi
+
+  cur=$(current_project 2>/dev/null || true)
+  if [ -n "$cur" ]; then
+    if [ -d "$cur" ]; then
+      echo "✅ current-project：$(pretty_path "$cur")"
+    else
+      echo "⚠️ current-project 指向不存在的目录：$(pretty_path "$cur")"
+      warn=$((warn + 1))
+    fi
+  else
+    echo "ℹ️ current-project 未设置"
+  fi
+
+  echo
+  if [ "$hard" -gt 0 ]; then
+    echo "结论：核心失败 ${hard} 项，警告 ${warn} 项。"
+    return 2
+  elif [ "$warn" -gt 0 ]; then
+    echo "结论：核心功能可用，但有 ${warn} 项警告。"
+    return 1
+  else
+    echo "结论：无异常（$ok 项工具就绪）。"
+    return 0
+  fi
+}
+
+cmd_project_current() {
+  local cur
+  cur=$(current_project 2>/dev/null || true)
+  if [ -z "$cur" ]; then
+    echo "未设置当前项目" >&2
+    return 1
+  fi
+  printf '%s\n' "$cur"
+}
+
+cmd_project_list() {
+  local line
+  [ -s "$AG_RECENT_FILE" ] || return 0
+  if [ ! -d "$AG_ORICO_VOLUME" ]; then
+    echo "⚠️ 外置盘 $AG_ORICO_VOLUME 未挂载" >&2
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    printf '%s\t%s\n' "$(basename "$line")" "$line"
+  done < "$AG_RECENT_FILE"
+}
+
+cmd_session_list() {
+  local s
+  local cmd
+  local kind
+
+  have tmux || { echo "tmux 不可用" >&2; return 1; }
+
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    cmd=$(session_command "$s")
+    kind="-"
+    case "$cmd" in
+      codex) kind="codex" ;;
+      claude) kind="claude" ;;
+      node)
+        if tmux capture-pane -p -t "=$s:" 2>/dev/null | head -40 | grep -qi 'codex'; then
+          kind="codex"
+        elif tmux capture-pane -p -t "=$s:" 2>/dev/null | head -40 | grep -qi 'claude'; then
+          kind="claude"
+        fi
+        ;;
+    esac
+    printf '%s\t%s\t%s\n' "$s" "$kind" "$(session_path "$s")"
+  done < <(list_sessions_raw)
+}
+
+# ------------------------------------------------------------
+# Self-test
+# ------------------------------------------------------------
+
+self_test_registry() (
+  local tmproot
+  local id1
+  local id2
+
+  tmproot=$(mktemp -d "${TMPDIR:-/tmp}/ag3-regtest.XXXXXX") || {
+    echo "FAIL self-test mktemp"
+    return 1
+  }
+  trap 'rm -rf "$tmproot"' EXIT
+
+  AG_STATE_DIR="$tmproot/state"
+  AG_LOG_FILE="$AG_STATE_DIR/logs/ag.log"
+  AG_RECENT_FILE="$AG_STATE_DIR/recent-projects"
+  AG_CURRENT_FILE="$AG_STATE_DIR/current-project"
+  AG_REGISTRY_DIR="$AG_STATE_DIR/projects"
+  mkdir -p "$tmproot/demo-a" "$tmproot/demo-b" || return 1
+
+  registry_create "demo-a" "$tmproot/demo-a" || { echo "FAIL registry_create"; return 1; }
+
+  id1=$(registry_id_for_path "$tmproot/demo-a")
+  [ -f "$AG_REGISTRY_DIR/${id1}.json" ] || { echo "FAIL registry file"; return 1; }
+  jq empty "$AG_REGISTRY_DIR/${id1}.json" >/dev/null 2>&1 || { echo "FAIL registry json"; return 1; }
+  [ "$(registry_get "$id1" lifecycle)" = "done" ] || { echo "FAIL lifecycle initial"; return 1; }
+
+  registry_set_field "$id1" lifecycle active || { echo "FAIL registry_set_field write"; return 1; }
+  [ "$(registry_get "$id1" lifecycle)" = "active" ] || { echo "FAIL registry_set_field"; return 1; }
+
+  id2=$(registry_id_for_path "$tmproot/demo-b")
+  [ "$id1" != "$id2" ] || { echo "FAIL registry ids distinct"; return 1; }
+)
+
+self_test() {
+  local got
+
+  got=$(sanitize_name 'my project:abc/test')
+  [ "$got" = 'my-project-abc-test' ] || { echo "FAIL sanitize_name: $got"; return 1; }
+
+  got=$(pretty_path "$HOME/test/path")
+  # shellcheck disable=SC2088  # 期望输出就是字面量 ~/
+  [ "$got" = '~/test/path' ] || { echo "FAIL pretty_path: $got"; return 1; }
+
+  got=$(canonical_dir "$HOME")
+  [ -n "$got" ] || { echo "FAIL canonical_dir"; return 1; }
+
+  got=$(printf 'a b  c\n' | tr ' ' '\n' | grep -c .)
+  [ "$got" = '3' ] || { echo "FAIL recipe-parse"; return 1; }
+
+  self_test_registry || return 1
+
+  if project_validate_name "a/b"; then echo "FAIL validate slash"; return 1; fi
+  if project_validate_name ".."; then echo "FAIL validate dotdot"; return 1; fi
+  if project_validate_name "   "; then echo "FAIL validate blank"; return 1; fi
+  project_validate_name "ok-name" || { echo "FAIL validate ok"; return 1; }
+
+  echo "ag self-test: PASS"
+}
+
+# ------------------------------------------------------------
+# 交互主菜单
+# ------------------------------------------------------------
+
+main_menu() {
+  require_gum || exit 1
+
+  banner
+
+  while true; do
+    c=$(menu_pick "主菜单" \
+      "🤖 Agent" "📁 项目" "🛠 开发" "🖥 工作台" "🧠 辅助" "退出") || return 0
+
+    case "$c" in
+      "🤖 Agent") agent_menu ;;
+      "📁 项目") project_menu ;;
+      "🛠 开发") dev_menu ;;
+      "🖥 工作台") workstation_menu ;;
+      "🧠 辅助") assist_menu ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------
+# Agent Workstation 集成（agent-notify 状态，V1.1 增量）
+# ------------------------------------------------------------
+AGENT_WS_STATE_DIR="$HOME/.agent-workstation/state"
+AGENT_WS_JQ="/usr/bin/jq"
+command -v jq >/dev/null 2>&1 && AGENT_WS_JQ="$(command -v jq)"
+: "${AG_AGENT_WS_DONE_TTL_HOURS:=24}"
+
+agent_ws_valid_id() {
+  local id="$1"
+  [ -n "$id" ] || return 1
+  [ "$id" != '.' ] && [ "$id" != '..' ] || return 1
+  case "$id" in
+    *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+agent_ws_iso_epoch() {
+  local normalized
+  normalized=$(printf '%s' "$1" | sed -E 's/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/')
+  date -j -f '%Y-%m-%dT%H:%M:%S%z' "$normalized" '+%s' 2>/dev/null
+}
+
+agent_ws_done_expired() {
+  local status="$1"
+  local updated="$2"
+  local updated_epoch
+  local now_epoch
+  local ttl_seconds
+
+  [ "$status" = 'DONE' ] || return 1
+  [ -n "$updated" ] && [ "$updated" != '-' ] || return 1
+  updated_epoch=$(agent_ws_iso_epoch "$updated") || return 1
+  now_epoch=$(date '+%s')
+  ttl_seconds=$((AG_AGENT_WS_DONE_TTL_HOURS * 3600))
+  [ "$((now_epoch - updated_epoch))" -gt "$ttl_seconds" ]
+}
+
+agent_ws_record_row() {
+  local file="$1"
+  "$AGENT_WS_JQ" -er \
+    '[(.status // "?"), (.agent // "?"), (.project // "?"), (.tmux_session // "-"), (.tmux_window // "-"), (.tmux_pane // "-"), (.id // "-"), (.updated_at // "-")] | @tsv' \
+    "$file" 2>/dev/null
+}
+
+# 输出 TSV：status agent project tmux_session tmux_window tmux_pane id updated_at
+# $1 = 过滤器：空=全部；具体状态名；BAD=FAILED+STALE
+agent_ws_rows() {
+  local filter="${1:-}"
+  local f row st ag pr ts tw tp id updated
+  [ -d "$AGENT_WS_STATE_DIR" ] || return 0
+  [ -x "$AGENT_WS_JQ" ] || return 0
+  for f in "$AGENT_WS_STATE_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    row=$(agent_ws_record_row "$f") || continue
+    [ -n "$row" ] || continue
+    IFS=$'\t' read -r st ag pr ts tw tp id updated <<<"$row"
+    case "$st" in
+      RUNNING|WAITING|DONE|FAILED|STALE|UNKNOWN) ;;
+      *) continue ;;
+    esac
+    agent_ws_valid_id "$id" || continue
+    case "$id" in
+      e2e-*) continue ;;
+    esac
+    agent_ws_done_expired "$st" "$updated" && continue
+    if [ -n "$filter" ]; then
+      if [ "$filter" = "BAD" ]; then
+        [ "$st" = "FAILED" ] || [ "$st" = "STALE" ] || continue
+      else
+        [ "$st" = "$filter" ] || continue
+      fi
+    fi
+    printf '%s\n' "$row"
+  done
+  return 0
+}
+
+agent_ws_print_rows() { # $1=rows [$2="n" 时每行前加编号]
+  local numbered="${2:-}"
+  printf '%s\n' "$1" | awk -F'\t' -v numbered="$numbered" '{
+    i=$1; icon="○";
+    if(i=="RUNNING")icon="●"; else if(i=="WAITING")icon="⚠"; else if(i=="DONE")icon="✓"; else if(i=="FAILED"||i=="STALE")icon="✕";
+    if(numbered=="n")
+      printf "  %d) %s %-8s %-7s tmux=%s:%s (%s)\n", NR, icon, $2, $3, $4, $5, $7;
+    else
+      printf "  %s %-8s %-7s tmux=%s:%s (%s)\n", icon, $2, $3, $4, $5, $7;
+  }'
+}
+
+# $1..$7 = st ag pr ts tw tp id
+agent_ws_jump() {
+  local st="$1" ag="$2" pr="$3" ts="$4" tw="$5" tp="$6" id="$7"
+  local TMUX_BIN="/opt/homebrew/bin/tmux"
+  [ "$ts" = '-' ] && ts=""
+  [ "$tw" = '-' ] && tw=""
+  [ "$tp" = '-' ] && tp=""
+  [ -x "$TMUX_BIN" ] || TMUX_BIN="$(command -v tmux 2>/dev/null || true)"
+  if [ -z "$TMUX_BIN" ]; then
+    echo "tmux 不可用"
+    return 1
+  fi
+  if [ -z "$ts" ]; then
+    echo "Agent ${id} 无 tmux 定位信息 (project=${pr})"
+    return 1
+  fi
+  local target="=${ts}"
+  [ -n "$tw" ] && target="${target}:${tw}"
+  if [ -n "${AGENT_WS_DRY_RUN:-}" ]; then
+    echo "[dry-run] id=$id target=$target pane=${tp:--} mode=$( [ -n "${TMUX:-}" ] && echo switch || echo attach )"
+    return 0
+  fi
+  if [ -n "${TMUX:-}" ]; then
+    "$TMUX_BIN" switch-client -t "$target" 2>/dev/null || "$TMUX_BIN" switch-client -t "=${ts}"
+    [ -n "$tp" ] && "$TMUX_BIN" select-pane -t "$tp" >/dev/null 2>&1
+  else
+    # 先把 session 当前 window/pane 设到 Agent 位置，再 attach（tmux 3.7c 用 = 会话名: 精确匹配）
+    [ -n "$tw" ] && "$TMUX_BIN" select-window -t "$target" >/dev/null 2>&1
+    [ -n "$tp" ] && "$TMUX_BIN" select-pane -t "$tp" >/dev/null 2>&1
+    "$TMUX_BIN" attach-session -t "=${ts}"
+  fi
+}
+
+agent_ws_actionable_waiting_rows() {
+  local rows
+  local row
+  local st ag pr ts tw tp id updated
+
+  rows=$(agent_ws_rows WAITING)
+  [ -n "$rows" ] || return 0
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    IFS=$'\t' read -r st ag pr ts tw tp id updated <<<"$row"
+    [ -n "$ts" ] && [ "$ts" != '-' ] || continue
+    session_exists "$ts" || continue
+    printf '%s\n' "$row"
+  done <<EOF
+$rows
+EOF
+}
+
+cmd_agent_waiting() {
+  local rows pick n count
+  rows=$(agent_ws_actionable_waiting_rows)
+  if [ -z "$rows" ]; then
+    echo "当前没有可跳转的 Waiting Agent"
+    return 0
+  fi
+  count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+  if [ "$count" -eq 1 ]; then
+    pick="$rows"
+  else
+    agent_ws_print_rows "$rows" n
+    printf '输入编号选择 Agent（回车取消）：'
+    read -r n
+    case "$n" in
+      ''|*[!0-9]*) echo "已取消"; return 0 ;;
+    esac
+    [ "$n" -ge 1 ] || { echo "编号无效"; return 1; }
+    pick=$(printf '%s\n' "$rows" | sed -n "${n}p")
+    if [ -z "$pick" ]; then echo "编号无效"; return 1; fi
+  fi
+  IFS=$'\t' read -r st ag pr ts tw tp id _updated <<<"$pick"
+  agent_ws_jump "$st" "$ag" "$pr" "$ts" "$tw" "$tp" "$id"
+}
+
+cmd_agent_failed() {
+  local rows
+  rows=$(agent_ws_rows BAD)
+  if [ -z "$rows" ]; then
+    echo "当前没有 Failed/Stale Agent"
+    return 0
+  fi
+  agent_ws_print_rows "$rows"
+  return 0
+}
+
+cmd_agent_open() {
+  local requested_id="${1:-}"
+  local f row st ag pr ts tw tp id updated
+  if [ -z "$requested_id" ]; then
+    echo "用法：ag open <agent-session-id>"
+    return 2
+  fi
+  if ! agent_ws_valid_id "$requested_id"; then
+    echo "Agent session id 非法。"
+    return 2
+  fi
+  [ -x "$AGENT_WS_JQ" ] || { echo "jq 不可用"; return 1; }
+  f="$AGENT_WS_STATE_DIR/${requested_id}.json"
+  if [ ! -f "$f" ]; then
+    echo "未找到 Agent session：$requested_id"
+    return 1
+  fi
+  row=$(agent_ws_record_row "$f") || { echo "Agent session 记录无法解析：$requested_id"; return 1; }
+  IFS=$'\t' read -r st ag pr ts tw tp id updated <<<"$row"
+  if [ "$id" != "$requested_id" ]; then
+    echo "Agent session 记录 ID 不匹配：$requested_id"
+    return 1
+  fi
+  case "$st" in
+    RUNNING|WAITING|DONE|FAILED|STALE|UNKNOWN) ;;
+    *) echo "Agent session 记录异常：$id"; return 1 ;;
+  esac
+  agent_ws_jump "$st" "$ag" "$pr" "$ts" "$tw" "$tp" "$id"
+}
+
+agent_ws_status_block() {
+  local all
+  all=$(agent_ws_rows "")
+  [ -n "$all" ] || return 0
+  echo ""
+  echo "Agent Workstation :"
+  agent_ws_print_rows "$all"
+}
+
+# ------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------
+
+trap 'printf "\n"; exit 0' INT TERM
+
+case "${1:-}" in
+
+  --version|-v)
+    echo "ag $AG_VERSION"
+    ;;
+
+  --help|-h)
+    cat <<EOF_HELP
+ag $AG_VERSION - AG Command Center
+
+交互菜单：
+  ag
+      打开分层菜单（Agent / 项目 / 开发 / 工作台 / 辅助）
+      新建 Codex/Claude 会话时可选择：标准模式（SAFE）/ 少打断模式（AUTO）/ YOLO 模式（信任项目）
+      工作台 → 会话中心：正在运行 / 已完成
+
+非交互子命令（适合人与 Agent 脚本调用）：
+  ag status            工作台状态概览
+  ag doctor            只读诊断（不做任何修改）
+                       doctor 退出码：0=健康，1=警告/环境受限，2=核心失败
+  ag w                 进入 WAITING 的 Agent（agent-notify）
+  ag f                 列出 FAILED/STALE 的 Agent（agent-notify）
+  ag open <id>         按 agent-session-id 打开对应 tmux 位置
+  ag project current   输出当前项目完整路径
+  ag project list      最近项目（名称<TAB>路径）
+  ag session list      tmux 会话（名称<TAB>Agent类型<TAB>路径）
+  ag --version / --self-test / --help
+EOF_HELP
+    ;;
+
+  --self-test)
+    self_test
+    ;;
+
+  status)
+    cmd_status
+    ;;
+
+  doctor)
+    cmd_doctor
+    echo
+    cmd_doctor_v24
+    ;;
+
+  project)
+    case "${2:-}" in
+      current) cmd_project_current ;;
+      list) cmd_project_list ;;
+      *)
+        echo "用法：ag project current | ag project list"
+        exit 2
+        ;;
+    esac
+    ;;
+
+  session)
+    case "${2:-}" in
+      list) cmd_session_list ;;
+      *)
+        echo "用法：ag session list"
+        exit 2
+        ;;
+    esac
+    ;;
+
+  w)
+    cmd_agent_waiting
+    ;;
+
+  f)
+    cmd_agent_failed
+    ;;
+
+  open)
+    cmd_agent_open "${2:-}"
+    ;;
+
+  '')
+    main_menu
+    ;;
+
+  *)
+    echo "未知参数：$1"
+    echo "执行 ag --help 查看帮助。"
+    exit 2
+    ;;
+
+esac

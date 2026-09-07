@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""ag-runtime-event — provider hook 事件管线入口。
+
+用法（hook 里调用，stdin 传 hook JSON）：
+  echo "$HOOK_JSON" | ag-runtime-event claude stop
+  ag-runtime-event codex turn_end
+
+设计约束：永远 exit 0、尽量快（<1s），绝不阻塞/拖垮 agent。
+事件只写入事件管线（events/<rt_id>.jsonl），不发通知——通知由
+refresh 的状态机统一触发，避免第二套通知路径。
+"""
+
+import hashlib
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.expanduser("~/.local/share/ag"))
+
+from runtime import config, project_policy, state_engine  # noqa: E402
+
+
+def main():
+    if len(sys.argv) < 3:
+        return 0
+    provider = sys.argv[1]
+    event = sys.argv[2]
+
+    payload = {}
+    try:
+        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+        if raw.strip():
+            payload = json.loads(raw)
+    except Exception:
+        payload = {}
+
+    cwd = payload.get("cwd") or ""
+    rt_id = _match_runtime(cwd)
+
+    try:
+        state_engine.append_event(rt_id, {
+            "provider": provider,
+            "event": event,
+            "cwd": cwd,
+            "session_id": payload.get("session_id"),
+            "hook": payload.get("hook_event_name"),
+        })
+    except OSError:
+        pass
+    return 0
+
+
+def _match_runtime(cwd):
+    """按 cwd 最长前缀匹配 runtime-state 里的记录；同长度取最新启动的；无匹配落 orphan 桶。"""
+    state = config.load_json(config.STATE_PATH) or {}
+    target = project_policy.canonical(cwd).rstrip("/") if cwd else ""
+    best, best_key = None, (-1, -1.0)
+    for rid, entry in (state.get("runtimes") or {}).items():
+        c = (entry.get("cwd") or "").rstrip("/")
+        if not c or not target:
+            continue
+        if target == c or target.startswith(c + "/"):
+            started = state_engine.parse_ts(entry.get("started_at")) or 0.0
+            key = (len(c), started)
+            if key > best_key:
+                best, best_key = rid, key
+    if best:
+        return best
+    # 稳定桶名：内建 hash() 受 PYTHONHASHSEED 随机化影响，跨进程不稳定
+    os.makedirs(state_engine.EVENTS_DIR, exist_ok=True)
+    return "orphan-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:8]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
