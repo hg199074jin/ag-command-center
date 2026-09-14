@@ -10,7 +10,7 @@
 
 set -u
 
-AG_VERSION="2.4.0"
+AG_VERSION="2.4.1"
 
 # 保证在非交互/launchd 环境下也能找到工具
 for _d in "$HOME/.local/bin" /opt/homebrew/bin; do
@@ -708,7 +708,9 @@ launch_command_for() {
 
   case "$launcher:$launch_mode" in
     Codex:standard) printf 'codex' ;;
-    Codex:assisted) printf 'codex --approve-for-me --sandbox workspace-write' ;;
+    # v2.4.1 修复：codex 0.152 的 --approve-for-me 自带 workspace-write 沙箱语义，
+    # 再显式传 --sandbox 会被参数冲突拒绝（YOLO gate 降级 AUTO 后曾因此启动失败）
+    Codex:assisted) printf 'codex --approve-for-me' ;;
     Codex:yolo) printf 'codex --dangerously-bypass-approvals-and-sandbox' ;;
     Claude:standard) printf 'claude' ;;
     Claude:assisted) printf 'claude --permission-mode auto' ;;
@@ -998,7 +1000,9 @@ pick_with_yazi() {
 
   tmp=$(mktemp "${TMPDIR:-/tmp}/ag3-yazi.XXXXXX") || return 1
 
-  yazi "$(ag_choose_default_root)" --cwd-file="$tmp"
+  # v2.4.1 修复：本函数常在 $( ) 中被调用，yazi 的 stdout 是管道；
+  # 重定向到 /dev/tty 后，误按 Enter 打开文件时的 vi 等 opener 才能拿到真终端
+  yazi "$(ag_choose_default_root)" --cwd-file="$tmp" >/dev/tty
   rc=$?
 
   if [ "$rc" -ne 0 ]; then
