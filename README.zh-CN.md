@@ -2,9 +2,13 @@
 
 中文 | **[English](README.md)**
 
+[![版本](https://img.shields.io/badge/version-2.4.1-blue)](https://github.com/hg199074jin/ag-command-center/releases)
 [![平台](https://img.shields.io/badge/platform-macOS-blue)](https://github.com/hg199074jin/ag-command-center)
 [![Shell](https://img.shields.io/badge/shell-bash%203.2%2B-green)](https://github.com/hg199074jin/ag-command-center)
+[![tmux](https://img.shields.io/badge/tmux-3.x-1BB91F)](https://github.com/tmux/tmux)
+[![界面](https://img.shields.io/badge/UI-gum%20%E8%8F%9C%E5%8D%95-FF6F61)](https://github.com/charmbracelet/gum)
 [![Python](https://img.shields.io/badge/python-纯标准库-3776ab)](https://github.com/hg199074jin/ag-command-center)
+[![Star](https://img.shields.io/github/stars/hg199074jin/ag-command-center?style=social&label=Star)](https://github.com/hg199074jin/ag-command-center/stargazers)
 [![许可](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
 **ag** 是 macOS 工作站上运行 AI 编码代理——[OpenAI Codex CLI](https://github.com/openai/codex) 与 [Claude Code](https://claude.com/claude-code)——的单命令指挥中心。它在 tmux 之上提供分层菜单、项目登记簿、统一权限模型、运行状态机和只读监控集成。
@@ -39,11 +43,13 @@
 
 **SAFE / AUTO / YOLO 三档权限** —— 跨 Provider 统一词汇，按能力探测映射到真实 CLI 参数：
 
-| ag 档位 | Codex CLI（0.153.x） | Claude Code（2.1.x） |
+| ag 档位 | Codex CLI（0.152.x+） | Claude Code（2.1.x） |
 |---|---|---|
 | `SAFE` | 默认审批 | 不传 `--permission-mode` |
-| `AUTO` | `--approve-for-me --sandbox workspace-write` | `--permission-mode auto` |
+| `AUTO` | `--approve-for-me` * | `--permission-mode auto` |
 | `YOLO` | `--dangerously-bypass-approvals-and-sandbox` | `--permission-mode bypassPermissions` |
+
+\* 自 v2.4.1 起 AUTO 只传 `--approve-for-me`：该参数本身就隐含 workspace-write 沙箱语义，再显式叠加 `--sandbox` 会被 codex 参数解析拒绝（`the argument '--approve-for-me' cannot be used with '--sandbox'`）。
 
 能力是**探测出来的，不是猜的**——`ag-provider-doctor` 解析 `--help` 输出并落盘真实支持项；适配器只会**降档**（如 `auto` → `acceptEdits`），绝不静默升档。
 
@@ -119,6 +125,7 @@ ag-run codex --mode yolo             # 真正启动（前台）
 | v2.2 | 项目登记簿 + 最近项目、外置盘 fail-safe |
 | v2.3.x | 指挥中心：会话中心、doctor、agentboard 集成、登记簿原子写 |
 | **v2.4.0** | SAFE/AUTO/YOLO + 能力探测、YOLO 闸门（fail-closed）、运行状态机、卡死检测、通知桥、用量快照、Worker 模式、监控集成；经外部代码评审关闭 1 项 Critical / 4 项 Important |
+| **v2.4.1** | 热修复：codex 0.152+ 的 AUTO 命令（`--approve-for-me` 不再叠加 `--sandbox`——参数冲突）；Yazi 选目录的输出重定向到 `/dev/tty`，误按 Enter 打开文件时 vi 等 opener 能拿到真实终端 |
 
 历史版本保留在 [`archive/`](archive/) 供参考。
 
