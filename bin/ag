@@ -10,7 +10,7 @@
 
 set -u
 
-AG_VERSION="2.4.1"
+AG_VERSION="2.4.2"
 
 # 保证在非交互/launchd 环境下也能找到工具
 for _d in "$HOME/.local/bin" /opt/homebrew/bin; do
@@ -658,7 +658,7 @@ v24_record_runtime() {
   [ "$key" != 'shell' ] || return 0
 
   rt_id=$(ag-run record-launch --provider "$key" --mode "$launch_mode" \
-    --session "$session" --cwd "$dir" 2>/dev/null) || {
+    --session "$session" --cwd "$dir" </dev/null 2>/dev/null) || {
     ag_log WARN "v2.4 runtime record 失败（不影响启动）：$key/$session/$dir"
     return 0
   }
@@ -693,7 +693,7 @@ launch_command_for() {
   # 消除与 providers/*.py 的双份映射；ag-run/jq 异常时回退本地映射（方向只降不升）
   key=$(launcher_key "$launcher" 2>/dev/null) || key=''
   if [ -n "$key" ] && [ "$key" != 'shell' ] && have ag-run && have jq; then
-    if resolved=$(ag-run resolve "$key" --mode "$launch_mode" 2>/dev/null); then
+    if resolved=$(ag-run resolve "$key" --mode "$launch_mode" </dev/null 2>/dev/null); then
       if printf '%s' "$resolved" | jq -e 'type=="object" and (.args|type)=="array"' >/dev/null 2>&1; then
         args=$(printf '%s' "$resolved" | jq -r '.args | join(" ")')
         if [ -n "$args" ]; then
@@ -807,7 +807,7 @@ create_session_for_dir() {
     local gate_result
     gate_result=''
     if have ag-run; then
-      gate_result=$(ag-run gate "$(launcher_key "$launcher")" --cwd "$dir" 2>/dev/null) || gate_result=''
+      gate_result=$(ag-run gate "$(launcher_key "$launcher")" --cwd "$dir" </dev/null 2>/dev/null) || gate_result=''
     fi
     case "$gate_result" in
       ALLOW) ;;
@@ -1616,10 +1616,13 @@ session_center_scan() {
   center_ids=()
   center_items=()
 
-  # ag v2.4：会话中心打开时刷新 runtime 状态（失败静默降级 v2.3）
+  # ag v2.4：会话中心打开时刷新 runtime 状态
+  # v2.4.2 修复：refresh 改为后台执行。原同步等待实测可达 20s+，界面冻结期间
+  # 用户按 Ctrl+Z 会把持锁进程挂起，毒死后续所有 ag-run（会话中心永久空屏）。
+  # state-summary 是纯读不抢锁，紧随其后读到的最多是几秒前的旧状态，可接受。
   if have ag-run; then
-    ag-run refresh --quiet >/dev/null 2>&1 || true
-    v24_summary=$(ag-run state-summary 2>/dev/null || true)
+    ag-run refresh --quiet >/dev/null 2>&1 </dev/null &
+    v24_summary=$(ag-run state-summary 2>/dev/null </dev/null || true)
   else
     v24_summary=''
   fi

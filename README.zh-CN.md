@@ -2,7 +2,7 @@
 
 中文 | **[English](README.md)**
 
-[![版本](https://img.shields.io/badge/version-2.4.1-blue)](https://github.com/hg199074jin/ag-command-center/releases)
+[![版本](https://img.shields.io/badge/version-2.4.2-blue)](https://github.com/hg199074jin/ag-command-center/releases)
 [![平台](https://img.shields.io/badge/platform-macOS-blue)](https://github.com/hg199074jin/ag-command-center)
 [![Shell](https://img.shields.io/badge/shell-bash%203.2%2B-green)](https://github.com/hg199074jin/ag-command-center)
 [![tmux](https://img.shields.io/badge/tmux-3.x-1BB91F)](https://github.com/tmux/tmux)
@@ -126,6 +126,7 @@ ag-run codex --mode yolo             # 真正启动（前台）
 | v2.3.x | 指挥中心：会话中心、doctor、agentboard 集成、登记簿原子写 |
 | **v2.4.0** | SAFE/AUTO/YOLO + 能力探测、YOLO 闸门（fail-closed）、运行状态机、卡死检测、通知桥、用量快照、Worker 模式、监控集成；经外部代码评审关闭 1 项 Critical / 4 项 Important |
 | **v2.4.1** | 热修复：codex 0.152+ 的 AUTO 命令（`--approve-for-me` 不再叠加 `--sandbox`——参数冲突）；Yazi 选目录的输出重定向到 `/dev/tty`，误按 Enter 打开文件时 vi 等 opener 能拿到真实终端 |
+| **v2.4.2** | 热修复：会话中心不再冻结——runtime `refresh` 改后台执行（同步等待实测 20s+）；`state.lock` 最多等 10 秒即降级为无锁写入，被 Ctrl+Z 挂起的持锁进程再也毒不死系统（此前表现为会话中心永久空屏） |
 
 历史版本保留在 [`archive/`](archive/) 供参考。
 
