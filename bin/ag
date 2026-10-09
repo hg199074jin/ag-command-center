@@ -10,7 +10,7 @@
 
 set -u
 
-AG_VERSION="2.4.2"
+AG_VERSION="2.5.0"
 
 # 保证在非交互/launchd 环境下也能找到工具
 for _d in "$HOME/.local/bin" /opt/homebrew/bin; do
@@ -126,6 +126,7 @@ launcher_key() {
   case "$1" in
     Codex|codex) printf 'codex' ;;
     Claude|claude) printf 'claude' ;;
+    OpenCode|opencode) printf 'opencode' ;;
     Shell|shell) printf 'shell' ;;
     *) return 1 ;;
   esac
@@ -715,6 +716,13 @@ launch_command_for() {
     Claude:standard) printf 'claude' ;;
     Claude:assisted) printf 'claude --permission-mode auto' ;;
     Claude:yolo) printf 'claude --permission-mode bypassPermissions' ;;
+    # v2.5.0：OpenCode。--auto = 自动批准未显式拒绝的权限（opencode 1.x 的
+    # 最高放行档，无独立全绕过旗标），所以 YOLO 与 AUTO 同义。Python 侧
+    # provider 注册表暂未收录 opencode，resolve 走本地映射回退；YOLO gate
+    # 对未知 provider 拒绝后 fail-safe 降级 AUTO——落到的仍是同一命令。
+    OpenCode:standard) printf 'opencode' ;;
+    OpenCode:assisted) printf 'opencode --auto' ;;
+    OpenCode:yolo) printf 'opencode --auto' ;;
     Shell:standard) printf '' ;;
     *) return 1 ;;
   esac
@@ -771,6 +779,14 @@ start_agent_in_session() {
     Claude)
       if ! have claude; then
         echo "错误：PATH 中没有找到 claude。"
+        return 1
+      fi
+      tmux send-keys -t "=$name:" "$command" C-m
+      ;;
+
+    OpenCode)
+      if ! have opencode; then
+        echo "错误：PATH 中没有找到 opencode。"
         return 1
       fi
       tmux send-keys -t "=$name:" "$command" C-m
@@ -872,6 +888,9 @@ create_session_for_dir() {
       ;;
     Claude)
       have claude || { echo "错误：没有找到 claude。"; pause; return 1; }
+      ;;
+    OpenCode)
+      have opencode || { echo "错误：没有找到 opencode。"; pause; return 1; }
       ;;
     Shell)
       ;;
@@ -1092,6 +1111,14 @@ agent_session_candidates() {
           printf '%s\t%s\t%s\n' "$s" "$cmd" "$(pretty_path "$(session_path "$s")")"
         fi
         ;;
+      opencode)
+        # opencode 是独立原生二进制，pane_current_command 应为 opencode；
+        # bun 兜底（其运行时若以 bun 身份出现在进程表时按界面文本识别）
+        if [ "$cmd" = "opencode" ] || { [ "$cmd" = "bun" ] && \
+          tmux capture-pane -p -t "=$s:" 2>/dev/null | head -40 | grep -qi 'opencode'; }; then
+          printf '%s\t%s\t%s\n' "$s" "$cmd" "$(pretty_path "$(session_path "$s")")"
+        fi
+        ;;
     esac
   done < <(list_sessions_raw)
 }
@@ -1151,8 +1178,8 @@ agent_menu() {
 
   while true; do
     c=$(menu_pick "🤖 Agent" \
-      "Codex 新任务" "Claude 新任务" \
-      "恢复 Codex" "恢复 Claude" "返回") || return 0
+      "Codex 新任务" "Claude 新任务" "OpenCode 新任务" \
+      "恢复 Codex" "恢复 Claude" "恢复 OpenCode" "返回") || return 0
 
     case "$c" in
       "Codex 新任务")
@@ -1169,11 +1196,21 @@ agent_menu() {
         gum confirm "在 $(pretty_path "$dir") 启动 Claude（$(launch_mode_label "$mode")）？" &&
           create_session_for_dir "$dir" Claude "" "$mode"
         ;;
+      "OpenCode 新任务")
+        dir=$(pick_project_for_launch) || continue
+        [ -n "$dir" ] || continue
+        mode=$(launch_mode_pick OpenCode) || continue
+        gum confirm "在 $(pretty_path "$dir") 启动 OpenCode（$(launch_mode_label "$mode")）？" &&
+          create_session_for_dir "$dir" OpenCode "" "$mode"
+        ;;
       "恢复 Codex")
         resume_agent_menu codex "Codex"
         ;;
       "恢复 Claude")
         resume_agent_menu claude "Claude"
+        ;;
+      "恢复 OpenCode")
+        resume_agent_menu opencode "OpenCode"
         ;;
       *)
         return 0
@@ -1234,7 +1271,7 @@ project_post_create_menu() {
   ag_log "project created dir=$target"
 
   sel=$(menu_pick "创建完成后的动作" \
-    "Codex" "Claude" "仅创建项目" "Yazi 打开" "返回") || return 0
+    "Codex" "Claude" "OpenCode" "仅创建项目" "Yazi 打开" "返回") || return 0
 
   case "$sel" in
     "Codex")
@@ -1244,6 +1281,10 @@ project_post_create_menu() {
     "Claude")
       mode=$(launch_mode_pick Claude) || return 0
       create_session_for_dir "$target" Claude "" "$mode"
+      ;;
+    "OpenCode")
+      mode=$(launch_mode_pick OpenCode) || return 0
+      create_session_for_dir "$target" OpenCode "" "$mode"
       ;;
     "Yazi 打开")
       have yazi && yazi "$target"
@@ -1373,7 +1414,7 @@ project_menu() {
     case "$c" in
       "最近项目")
         dir=$(pick_from_recent) || continue
-        launcher=$(menu_pick "启动什么" "Codex" "Claude" "Shell") || continue
+        launcher=$(menu_pick "启动什么" "Codex" "Claude" "OpenCode" "Shell") || continue
         mode=$(launch_mode_pick "$launcher") || continue
         create_session_for_dir "$dir" "$launcher" "" "$mode"
         ;;
@@ -2600,7 +2641,7 @@ ag $AG_VERSION - AG Command Center
 交互菜单：
   ag
       打开分层菜单（Agent / 项目 / 开发 / 工作台 / 辅助）
-      新建 Codex/Claude 会话时可选择：标准模式（SAFE）/ 少打断模式（AUTO）/ YOLO 模式（信任项目）
+      新建 Codex/Claude/OpenCode 会话时可选择：标准模式（SAFE）/ 少打断模式（AUTO）/ YOLO 模式（信任项目）
       工作台 → 会话中心：正在运行 / 已完成
 
 非交互子命令（适合人与 Agent 脚本调用）：

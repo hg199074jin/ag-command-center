@@ -2,7 +2,7 @@
 
 **[中文文档](README.zh-CN.md)** | English
 
-[![Version](https://img.shields.io/badge/version-2.4.2-blue)](https://github.com/hg199074jin/ag-command-center/releases)
+[![Version](https://img.shields.io/badge/version-2.5.0-blue)](https://github.com/hg199074jin/ag-command-center/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS-blue)](https://github.com/hg199074jin/ag-command-center)
 [![Shell](https://img.shields.io/badge/shell-bash%203.2%2B-green)](https://github.com/hg199074jin/ag-command-center)
 [![tmux](https://img.shields.io/badge/tmux-3.x-1BB91F)](https://github.com/tmux/tmux)
@@ -127,6 +127,7 @@ Uninstall / roll back: `ag-v2.4-rollback` restores the previous ag and renames s
 | **v2.4.0** | SAFE/AUTO/YOLO + capability probes, YOLO gate (fail-closed), runtime state machine, stuck detection, notification bridge, usage snapshots, worker mode, observability integrations; external code review closed 1 Critical / 4 Important findings |
 | **v2.4.1** | hotfix: AUTO command for codex 0.152+ (`--approve-for-me` no longer stacks `--sandbox` — clap conflict); Yazi directory picker routes its output to `/dev/tty` so file openers (vi) get a real terminal |
 | **v2.4.2** | hotfix: session center no longer freezes — runtime `refresh` moved to background (it could block 20s+); `state.lock` now waits at most 10s then degrades to lock-free write, so a Ctrl+Z-suspended lock holder can no longer poison every `ag-run` (the cause of a permanently empty session center) |
+| **v2.5.0** | OpenCode launcher (sst/opencode) alongside Codex/Claude: new-task + resume + post-create menus, SAFE/AUTO/YOLO tiers (AUTO and YOLO both map to `opencode --auto`, the highest approval tier opencode offers), session identity & tmux persistence. The Python provider registry is not yet opencode-aware: launch resolves via the local fallback map and the runtime record degrades to a logged WARN |
 
 Historical versions are kept under [`archive/`](archive/) for reference.
 
