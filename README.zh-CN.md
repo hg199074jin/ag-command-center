@@ -2,7 +2,7 @@
 
 中文 | **[English](README.md)**
 
-[![版本](https://img.shields.io/badge/version-2.5.0-blue)](https://github.com/hg199074jin/ag-command-center/releases)
+[![版本](https://img.shields.io/badge/version-2.6.0-blue)](https://github.com/hg199074jin/ag-command-center/releases)
 [![平台](https://img.shields.io/badge/platform-macOS-blue)](https://github.com/hg199074jin/ag-command-center)
 [![Shell](https://img.shields.io/badge/shell-bash%203.2%2B-green)](https://github.com/hg199074jin/ag-command-center)
 [![tmux](https://img.shields.io/badge/tmux-3.x-1BB91F)](https://github.com/tmux/tmux)
@@ -128,6 +128,7 @@ ag-run codex --mode yolo             # 真正启动（前台）
 | **v2.4.1** | 热修复：codex 0.152+ 的 AUTO 命令（`--approve-for-me` 不再叠加 `--sandbox`——参数冲突）；Yazi 选目录的输出重定向到 `/dev/tty`，误按 Enter 打开文件时 vi 等 opener 能拿到真实终端 |
 | **v2.4.2** | 热修复：会话中心不再冻结——runtime `refresh` 改后台执行（同步等待实测 20s+）；`state.lock` 最多等 10 秒即降级为无锁写入，被 Ctrl+Z 挂起的持锁进程再也毒不死系统（此前表现为会话中心永久空屏） |
 | **v2.5.0** | 新增 OpenCode 启动器（sst/opencode），与 Codex/Claude 并列：新任务 + 恢复 + 新建项目后动作三个菜单全部接线，SAFE/AUTO/YOLO 三档（AUTO 与 YOLO 都映射 `opencode --auto`——opencode 的最高放行档），会话身份与 tmux 持久运行照常。Python 侧 provider 注册表暂未收录 opencode：启动经本地映射回退解析，运行时登记降级为 WARN 日志（不影响启动） |
+| **v2.6.0** | 恢复菜单升级为两段式：`● 运行中`照常直接进入；`○ 已退出`（如 Ctrl+C 退出了 Agent 但 tmux 会话还在）依据持久化的 `@ag_agent` 会话身份自动识别，回车即一键续聊重启——在原项目目录经 `tmux respawn-pane` 自动带上次对话（`opencode -c` / `claude --continue` / `codex resume --last`） |
 
 历史版本保留在 [`archive/`](archive/) 供参考。
 

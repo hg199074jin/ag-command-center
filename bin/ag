@@ -10,7 +10,7 @@
 
 set -u
 
-AG_VERSION="2.5.0"
+AG_VERSION="2.6.0"
 
 # 保证在非交互/launchd 环境下也能找到工具
 for _d in "$HOME/.local/bin" /opt/homebrew/bin; do
@@ -1123,15 +1123,74 @@ agent_session_candidates() {
   done < <(list_sessions_raw)
 }
 
+# ------------------------------------------------------------
+# v2.6.0：已退出会话的识别与续聊重启
+# ------------------------------------------------------------
+
+agent_continue_command() {
+  # 各 Agent 的"继续上一个会话"命令（历史都在本地数据库，退出可续）
+  case "$1" in
+    opencode) printf 'opencode -c' ;;
+    claude) printf 'claude --continue' ;;
+    codex) printf 'codex resume --last' ;;
+    *) return 1 ;;
+  esac
+}
+
+agent_exited_candidates() {
+  # Agent 已退出、但 ag 创建的 tmux 会话仍在（pane 回到 shell）的列表。
+  # 依据会话身份元数据 @ag_agent 识别（不靠猜测），并排除仍在运行的。
+  local kind="$1"
+  local running
+  local s
+  local ident
+  local cmd
+
+  running=$(agent_session_candidates "$kind" | cut -f1)
+
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    printf '%s\n' "$running" | grep -qxF -- "$s" && continue
+    ident=$(session_option_get "$s" "@ag_agent")
+    [ "$ident" = "$kind" ] || continue
+    cmd=$(session_command "$s")
+    printf '%s\t%s\t%s\n' "$s" "$cmd" "$(pretty_path "$(session_path "$s")")"
+  done < <(list_sessions_raw)
+}
+
+resume_reopen_agent() {
+  local name="$1"
+  local kind="$2"
+  local cont
+  local path
+
+  cont=$(agent_continue_command "$kind") || return 0
+  path=$(session_option_get "$name" "@ag_project_path")
+  [ -d "$path" ] || path=$(session_path "$name")
+  [ -d "$path" ] || path="$HOME"
+
+  # respawn 在原 pane 内以续聊命令替换已退出的 shell；
+  # -c 指定项目目录，避免落在错误路径；-k 清掉可能残留的提示状态
+  if tmux respawn-pane -k -t "=$name:" -c "$path" "$cont"; then
+    ag_log "reopen kind=$kind session=$name cmd=$cont"
+    enter_session "$name"
+  else
+    echo "错误：无法在会话 '$name' 中重启 $kind。"
+    pause
+  fi
+}
+
 resume_agent_menu() {
   local kind="$1"
   local label="$2"
   local -a items=()
   local -a targets=()
+  local -a kinds=()
   local name
   local i
   local sel
   local picked
+  local action
 
   if ! have tmux; then
     echo "错误：没有找到 tmux。"
@@ -1139,29 +1198,48 @@ resume_agent_menu() {
     return 0
   fi
 
+  # v2.6.0：两段式恢复——● 运行中（回车直接进入）/ ○ 已退出（回车＝续上次对话重启）
   while IFS=$'\t' read -r name _cmd _path; do
     [ -n "$name" ] || continue
-    items+=("$name  （${_cmd} · ${_path}）")
+    items+=("● $name  （${_cmd} · ${_path}）")
     targets+=("$name")
+    kinds+=("run")
   done < <(agent_session_candidates "$kind")
+
+  while IFS=$'\t' read -r name _cmd _path; do
+    [ -n "$name" ] || continue
+    items+=("○ $name  （已退出 · 可续聊 · ${_path}）")
+    targets+=("$name")
+    kinds+=("reopen")
+  done < <(agent_exited_candidates "$kind")
 
   if [ "${#targets[@]}" -eq 0 ]; then
     echo
-    echo "暂无正在运行 $label 的会话。"
-    echo "可能 Agent 已退出，可通过 🤖 Agent → ${label} 新任务 重新启动，"
+    echo "暂无 $label 会话（运行中或已退出均无）。"
+    echo "可通过 🤖 Agent → ${label} 新任务 重新启动，"
     echo "或运行 ag session list 查看所有 tmux 会话。"
     pause
     return 0
   fi
 
-  sel=$(menu_pick "恢复 $label" "${items[@]}") || return 0
+  sel=$(menu_pick "恢复 $label（● 进入  ○ 续聊重启）" "${items[@]}") || return 0
 
   picked=""
+  action=""
   for i in "${!items[@]}"; do
-    [ "${items[$i]}" = "$sel" ] && picked="${targets[$i]}" && break
+    if [ "${items[$i]}" = "$sel" ]; then
+      picked="${targets[$i]}"
+      action="${kinds[$i]}"
+      break
+    fi
   done
 
   [ -n "$picked" ] || return 0
+
+  if [ "$action" = "reopen" ]; then
+    resume_reopen_agent "$picked" "$kind"
+    return 0
+  fi
 
   ag_log "resume kind=$kind session=$picked"
   enter_session "$picked"
@@ -2642,6 +2720,7 @@ ag $AG_VERSION - AG Command Center
   ag
       打开分层菜单（Agent / 项目 / 开发 / 工作台 / 辅助）
       新建 Codex/Claude/OpenCode 会话时可选择：标准模式（SAFE）/ 少打断模式（AUTO）/ YOLO 模式（信任项目）
+      恢复菜单：● 运行中直接进入 ｜ ○ 已退出可续聊重启（自动带 -c / --continue / resume --last）
       工作台 → 会话中心：正在运行 / 已完成
 
 非交互子命令（适合人与 Agent 脚本调用）：
