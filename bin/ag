@@ -10,7 +10,7 @@
 
 set -u
 
-AG_VERSION="2.6.0"
+AG_VERSION="2.6.1"
 
 # 保证在非交互/launchd 环境下也能找到工具
 for _d in "$HOME/.local/bin" /opt/homebrew/bin; do
@@ -1879,7 +1879,7 @@ project_detail() {
     if [ "$running" -eq 1 ]; then
       opts+=("进入会话" "结束项目（关闭会话并标记已完成）")
     else
-      opts+=("重新启动 Codex" "重新启动 Claude")
+      opts+=("重新启动 Codex" "重新启动 Claude" "重新启动 OpenCode")
     fi
     opts+=("Yazi 打开目录")
     opts+=("返回")
@@ -1899,6 +1899,11 @@ project_detail() {
       "重新启动 Claude")
         mode=$(launch_mode_pick Claude) || continue
         create_session_for_dir "$path" Claude "" "$mode"
+        return 0
+        ;;
+      "重新启动 OpenCode")
+        mode=$(launch_mode_pick OpenCode) || continue
+        create_session_for_dir "$path" OpenCode "" "$mode"
         return 0
         ;;
       "Yazi 打开目录")

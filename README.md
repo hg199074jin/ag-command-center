@@ -2,7 +2,7 @@
 
 **[中文文档](README.zh-CN.md)** | English
 
-[![Version](https://img.shields.io/badge/version-2.6.0-blue)](https://github.com/hg199074jin/ag-command-center/releases)
+[![Version](https://img.shields.io/badge/version-2.6.1-blue)](https://github.com/hg199074jin/ag-command-center/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS-blue)](https://github.com/hg199074jin/ag-command-center)
 [![Shell](https://img.shields.io/badge/shell-bash%203.2%2B-green)](https://github.com/hg199074jin/ag-command-center)
 [![tmux](https://img.shields.io/badge/tmux-3.x-1BB91F)](https://github.com/tmux/tmux)
@@ -129,6 +129,7 @@ Uninstall / roll back: `ag-v2.4-rollback` restores the previous ag and renames s
 | **v2.4.2** | hotfix: session center no longer freezes — runtime `refresh` moved to background (it could block 20s+); `state.lock` now waits at most 10s then degrades to lock-free write, so a Ctrl+Z-suspended lock holder can no longer poison every `ag-run` (the cause of a permanently empty session center) |
 | **v2.5.0** | OpenCode launcher (sst/opencode) alongside Codex/Claude: new-task + resume + post-create menus, SAFE/AUTO/YOLO tiers (AUTO and YOLO both map to `opencode --auto`, the highest approval tier opencode offers), session identity & tmux persistence. The Python provider registry is not yet opencode-aware: launch resolves via the local fallback map and the runtime record degrades to a logged WARN |
 | **v2.6.0** | two-tier resume menus: `● running` sessions attach as before, while `○ exited` sessions (agent quit via Ctrl+C but the tmux session survives) are discovered through the persisted `@ag_agent` session identity and can be reopened with one Enter — automatically continuing the last conversation (`opencode -c` / `claude --continue` / `codex resume --last`) in the original project directory via `tmux respawn-pane` |
+| **v2.6.1** | session center project detail adds a "重新启动 OpenCode" restart entry for completed projects, matching the existing Codex/Claude restart items (mode picker → fresh OpenCode session in the project directory) |
 
 Historical versions are kept under [`archive/`](archive/) for reference.
 
